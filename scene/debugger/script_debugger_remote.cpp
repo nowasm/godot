@@ -31,7 +31,6 @@
 #include "script_debugger_remote.h"
 
 #include "core/engine.h"
-#include "core/io/ip.h"
 #include "core/io/marshalls.h"
 #include "core/os/input.h"
 #include "core/os/os.h"
@@ -62,39 +61,7 @@ void ScriptDebuggerRemote::_send_video_memory() {
 }
 
 Error ScriptDebuggerRemote::connect_to_host(const String &p_host, uint16_t p_port) {
-	IP_Address ip;
-	if (p_host.is_valid_ip_address()) {
-		ip = p_host;
-	} else {
-		ip = IP::get_singleton()->resolve_hostname(p_host);
-	}
-
-	int port = p_port;
-
-	const int tries = 6;
-	int waits[tries] = { 1, 10, 100, 1000, 1000, 1000 };
-
-	tcp_client->connect_to_host(ip, port);
-
-	for (int i = 0; i < tries; i++) {
-		if (tcp_client->get_status() == StreamPeerTCP::STATUS_CONNECTED) {
-			print_verbose("Remote Debugger: Connected!");
-			break;
-		} else {
-			const int ms = waits[i];
-			OS::get_singleton()->delay_usec(ms * 1000);
-			print_verbose("Remote Debugger: Connection failed with status: '" + String::num(tcp_client->get_status()) + "', retrying in " + String::num(ms) + " msec.");
-		};
-	};
-
-	if (tcp_client->get_status() != StreamPeerTCP::STATUS_CONNECTED) {
-		ERR_PRINT("Remote Debugger: Unable to connect. Status: " + String::num(tcp_client->get_status()) + ".");
-		return FAILED;
-	};
-
-	packet_peer_stream->set_stream_peer(tcp_client);
-
-	return OK;
+	return transport.connect_to_host(p_host, p_port);
 }
 
 void ScriptDebuggerRemote::_put_variable(const String &p_name, const Variant &p_variable) {
@@ -134,7 +101,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		return;
 	}
 
-	ERR_FAIL_COND_MSG(!tcp_client->is_connected_to_host(), "Script Debugger failed to connect, but being used anyway.");
+	ERR_FAIL_COND_MSG(!transport.is_connected(), "Script Debugger v2 requires connected control and data channels.");
 
 	if (allow_focus_steal_pid) {
 		OS::get_singleton()->enable_for_stealing_focus(allow_focus_steal_pid);
@@ -1003,7 +970,7 @@ void ScriptDebuggerRemote::_send_network_bandwidth_usage() {
 
 void ScriptDebuggerRemote::send_message(const String &p_message, const Array &p_args) {
 	mutex.lock();
-	if (!locking && tcp_client->is_connected_to_host()) {
+	if (!locking && transport.is_data_connected()) {
 		if (messages.size() >= max_messages_per_frame) {
 			n_messages_dropped++;
 		} else {
@@ -1060,7 +1027,7 @@ void ScriptDebuggerRemote::send_error(const String &p_func, const String &p_file
 
 	mutex.lock();
 
-	if (!locking && tcp_client->is_connected_to_host()) {
+	if (!locking && transport.is_data_connected()) {
 		if (oe.warning) {
 			if (warn_count > max_warnings_per_second) {
 				n_warnings_dropped++;
@@ -1106,7 +1073,7 @@ void ScriptDebuggerRemote::_print_handler(void *p_this, const String &p_string, 
 	bool overflowed = sdr->char_count >= sdr->max_cps;
 
 	sdr->mutex.lock();
-	if (!sdr->locking && sdr->tcp_client->is_connected_to_host()) {
+	if (!sdr->locking && sdr->transport.is_data_connected()) {
 		if (overflowed) {
 			s += "[...]";
 		}
@@ -1187,8 +1154,7 @@ ScriptDebuggerRemote::ScriptDebuggerRemote() :
 		max_frame_functions(16),
 		skip_profile_frame(false),
 		reload_all_scripts(false),
-		tcp_client(Ref<StreamPeerTCP>(memnew(StreamPeerTCP))),
-		packet_peer_stream(Ref<PacketPeerStream>(memnew(PacketPeerStream))),
+		packet_peer_stream(transport.get_legacy_data_peer()),
 		last_perf_time(0),
 		last_net_prof_time(0),
 		last_net_bandwidth_time(0),
@@ -1210,9 +1176,6 @@ ScriptDebuggerRemote::ScriptDebuggerRemote() :
 		locking(false),
 		poll_every(0),
 		scene_tree(nullptr) {
-	packet_peer_stream->set_stream_peer(tcp_client);
-	packet_peer_stream->set_output_buffer_max_size((1024 * 1024 * 8) - 4); // 8 MiB should be way more than enough, minus 4 bytes for separator.
-
 	phl.printfunc = _print_handler;
 	phl.userdata = this;
 	add_print_handler(&phl);

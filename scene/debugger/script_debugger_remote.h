@@ -31,11 +31,10 @@
 #ifndef SCRIPT_DEBUGGER_REMOTE_H
 #define SCRIPT_DEBUGGER_REMOTE_H
 
-#include "core/io/packet_peer.h"
-#include "core/io/stream_peer_tcp.h"
 #include "core/list.h"
 #include "core/os/os.h"
 #include "core/script_language.h"
+#include "debug_transport_v2.h"
 
 class SceneTree;
 
@@ -64,7 +63,7 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 	bool skip_profile_frame;
 	bool reload_all_scripts;
 
-	Ref<StreamPeerTCP> tcp_client;
+	DebugTransportV2 transport;
 	Ref<PacketPeerStream> packet_peer_stream;
 
 	uint64_t last_perf_time;
