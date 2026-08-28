@@ -186,6 +186,120 @@ void DebugTransportV2::disconnect() {
 	if (data_tcp.is_valid()) {
 		data_tcp->disconnect_from_host();
 	}
+	control_peer->set_stream_peer(Ref<StreamPeer>());
+	data_peer->set_stream_peer(Ref<StreamPeer>());
+	reconnecting = false;
+	reconnect_hello_sent = false;
+	reconnect_control_ack = false;
+	reconnect_data_ack = false;
+}
+
+Error DebugTransportV2::start_reconnect() {
+	ERR_FAIL_COND_V(reconnect_host.empty() || reconnect_port == 0, ERR_UNCONFIGURED);
+	disconnect();
+	control_tcp = Ref<StreamPeerTCP>(memnew(StreamPeerTCP));
+	data_tcp = Ref<StreamPeerTCP>(memnew(StreamPeerTCP));
+	generation++;
+	if (generation == 0) {
+		generation = 1;
+	}
+	control_sequence = 0;
+	data_sequence = 0;
+
+	IP_Address ip;
+	if (reconnect_host.is_valid_ip_address()) {
+		ip = reconnect_host;
+	} else {
+		ip = IP::get_singleton()->resolve_hostname(reconnect_host);
+	}
+	if (!ip.is_valid()) {
+		return ERR_CANT_RESOLVE;
+	}
+
+	Error error = control_tcp->connect_to_host(ip, reconnect_port);
+	if (error == OK) {
+		error = data_tcp->connect_to_host(ip, reconnect_port);
+	}
+	if (error != OK) {
+		disconnect();
+		return error;
+	}
+
+	reconnecting = true;
+	reconnect_started_msec = OS::get_singleton()->get_ticks_msec();
+	return ERR_BUSY;
+}
+
+Error DebugTransportV2::poll_reconnect(uint32_t p_timeout_msec) {
+	if (!reconnecting) {
+		return is_connected() ? OK : ERR_UNCONFIGURED;
+	}
+	if (OS::get_singleton()->get_ticks_msec() - reconnect_started_msec > p_timeout_msec) {
+		disconnect();
+		return ERR_TIMEOUT;
+	}
+
+	const StreamPeerTCP::Status control_status = control_tcp->get_status();
+	const StreamPeerTCP::Status data_status = data_tcp->get_status();
+	if (control_status == StreamPeerTCP::STATUS_ERROR || data_status == StreamPeerTCP::STATUS_ERROR) {
+		disconnect();
+		return ERR_CANT_CONNECT;
+	}
+	if (control_status != StreamPeerTCP::STATUS_CONNECTED || data_status != StreamPeerTCP::STATUS_CONNECTED) {
+		return ERR_BUSY;
+	}
+
+	if (!reconnect_hello_sent) {
+		control_tcp->set_no_delay(true);
+		data_tcp->set_no_delay(true);
+		control_peer->set_stream_peer(control_tcp);
+		data_peer->set_stream_peer(data_tcp);
+		Array hello_payload;
+		hello_payload.push_back(OS::get_singleton()->get_process_id());
+		hello_payload.push_back(heartbeat_interval_msec);
+		hello_payload.push_back(variable_page_size);
+		if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK) {
+			disconnect();
+			return ERR_CANT_CONNECT;
+		}
+		reconnect_hello_sent = true;
+	}
+
+	if (!reconnect_control_ack) {
+		DebugProtocolV2::Envelope message;
+		Error error = poll_control(message);
+		if (error == OK) {
+			if (message.type != "hello_ack") {
+				disconnect();
+				return ERR_INVALID_DATA;
+			}
+			reconnect_control_ack = true;
+		} else if (error != ERR_UNAVAILABLE) {
+			disconnect();
+			return error;
+		}
+	}
+	if (!reconnect_data_ack) {
+		DebugProtocolV2::Envelope message;
+		Error error = poll_data(message);
+		if (error == OK) {
+			if (message.type != "hello_ack") {
+				disconnect();
+				return ERR_INVALID_DATA;
+			}
+			reconnect_data_ack = true;
+		} else if (error != ERR_UNAVAILABLE) {
+			disconnect();
+			return error;
+		}
+	}
+
+	if (!reconnect_control_ack || !reconnect_data_ack) {
+		return ERR_BUSY;
+	}
+	reconnecting = false;
+	print_verbose("Remote Debugger v2: reconnected with generation " + String::num_int64(generation) + ".");
+	return OK;
 }
 
 Error DebugTransportV2::send_control(const String &p_type, const Array &p_payload, uint64_t p_request_id, uint64_t p_stop_id) {
@@ -239,7 +353,7 @@ bool DebugTransportV2::is_data_connected() const {
 }
 
 bool DebugTransportV2::is_connected() const {
-	return is_control_connected() && is_data_connected();
+	return !reconnecting && is_control_connected() && is_data_connected();
 }
 
 DebugTransportV2::DebugTransportV2() :

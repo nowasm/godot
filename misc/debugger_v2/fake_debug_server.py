@@ -137,7 +137,104 @@ def _ack_for(hello: list[Any]) -> list[Any]:
     ]
 
 
-def _serve(listener: socket.socket, result: dict[str, Any]) -> None:
+def _command(hello: list[Any], sequence: int, request_id: int, stop_id: int, message_type: str) -> list[Any]:
+    return [
+        MAGIC,
+        MAJOR,
+        MINOR,
+        hello[3],
+        hello[4],
+        0,
+        sequence,
+        request_id,
+        stop_id,
+        message_type,
+        [],
+    ]
+
+
+def _receive_envelope(connection: socket.socket, message_type: str) -> list[Any]:
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        packet = _receive_packet(connection)
+        if isinstance(packet, list) and len(packet) == 11 and packet[9] == message_type:
+            return packet
+    raise ProtocolError(f"timed out waiting for {message_type}")
+
+
+def _assert_ack(packet: list[Any], request_id: int, accepted: bool, reason: str, duplicate: bool = False) -> None:
+    if packet[7] != request_id:
+        raise ProtocolError(f"ack request id {packet[7]} != {request_id}")
+    payload = packet[10]
+    if payload[:3] != [accepted, duplicate, reason]:
+        raise ProtocolError(f"unexpected ack payload for request {request_id}: {payload}")
+
+
+def _exercise_control(control: socket.socket, hello: list[Any], result: dict[str, Any]) -> None:
+    _send_packet(control, _command(hello, 2, 2, 0, "pause"))
+    _assert_ack(_receive_envelope(control, "ack"), 2, True, "accepted")
+    stopped = _receive_envelope(control, "stopped")
+    if len(stopped[10]) != 3:
+        raise ProtocolError(f"stopped event is not minimal: {stopped[10]}")
+    stop_id = stopped[8]
+    sequence = 10
+
+    pause = _command(hello, sequence, 10, stop_id, "pause")
+    _send_packet(control, pause)
+    _assert_ack(_receive_envelope(control, "ack"), 10, True, "already_paused")
+
+    _send_packet(control, pause)
+    _assert_ack(_receive_envelope(control, "ack"), 10, True, "already_paused", duplicate=True)
+
+    sequence += 1
+    _send_packet(control, _command(hello, sequence, 11, stop_id - 1, "next"))
+    _assert_ack(_receive_envelope(control, "ack"), 11, False, "stale_stop_id")
+
+    sequence += 1
+    _send_packet(control, _command(hello, sequence, 9, stop_id, "next"))
+    _assert_ack(_receive_envelope(control, "ack"), 9, False, "out_of_order_request_id")
+
+    acknowledgement_msec: list[float] = []
+    for cycle in range(20):
+        sequence += 1
+        request_id = 20 + cycle
+        started = time.perf_counter()
+        _send_packet(control, _command(hello, sequence, request_id, stop_id, "next"))
+        _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
+        acknowledgement_msec.append((time.perf_counter() - started) * 1000.0)
+        _receive_envelope(control, "running")
+        stopped = _receive_envelope(control, "stopped")
+        if stopped[8] <= stop_id:
+            raise ProtocolError("stop id did not increase after next")
+        stop_id = stopped[8]
+
+    sorted_latency = sorted(acknowledgement_msec)
+    p95_index = max(0, int(len(sorted_latency) * 0.95) - 1)
+    result["ack_p95_msec"] = sorted_latency[p95_index]
+    if result["ack_p95_msec"] >= 50.0:
+        raise ProtocolError(f"local control ack P95 is {result['ack_p95_msec']:.2f} ms")
+
+    result["control_closed_at"] = time.perf_counter()
+    control.shutdown(socket.SHUT_RDWR)
+    control.close()
+
+
+def _exercise_timeout(control: socket.socket, hello: list[Any], result: dict[str, Any]) -> None:
+    _send_packet(control, _command(hello, 2, 2, 0, "pause"))
+    _assert_ack(_receive_envelope(control, "ack"), 2, True, "accepted")
+    _receive_envelope(control, "stopped")
+    started = time.perf_counter()
+    diagnostic = _receive_envelope(control, "diagnostic")
+    result["timeout_recovery_msec"] = (time.perf_counter() - started) * 1000.0
+    if diagnostic[10] != ["control_timeout_auto_continue"]:
+        raise ProtocolError(f"unexpected timeout diagnostic: {diagnostic[10]}")
+    if not 900.0 <= result["timeout_recovery_msec"] < 1250.0:
+        raise ProtocolError(
+            f"heartbeat timeout recovery took {result['timeout_recovery_msec']:.2f} ms"
+        )
+
+
+def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> None:
     connections: list[socket.socket] = []
     try:
         listener.settimeout(5.0)
@@ -163,6 +260,37 @@ def _serve(listener: socket.socket, result: dict[str, Any]) -> None:
         if len({(hello[3], hello[4]) for hello in hellos}) != 1:
             raise ProtocolError("control and data channels do not share a session")
         result["hellos"] = hellos
+        if scenario == "control":
+            control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
+            _exercise_control(connections[control_index], hellos[control_index], result)
+            connections.pop(control_index)
+        elif scenario == "timeout":
+            control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
+            _exercise_timeout(connections[control_index], hellos[control_index], result)
+        elif scenario == "reconnect":
+            original_session = hellos[0][3]
+            original_generation = hellos[0][4]
+            for connection in connections:
+                connection.shutdown(socket.SHUT_RDWR)
+                connection.close()
+            connections.clear()
+            reconnected: list[list[Any]] = []
+            for _ in range(2):
+                connection, _ = listener.accept()
+                connections.append(connection)
+                connection.settimeout(3.0)
+                packet = _receive_packet(connection)
+                if not isinstance(packet, list) or len(packet) != 11:
+                    raise ProtocolError("reconnect hello is not a protocol-v2 envelope")
+                reconnected.append(packet)
+                _send_packet(connection, _ack_for(packet))
+            if {packet[9] for packet in reconnected} != {"control_hello", "data_hello"}:
+                raise ProtocolError("reconnect did not restore both channel roles")
+            if {packet[3] for packet in reconnected} != {original_session}:
+                raise ProtocolError("reconnect changed the session id")
+            if {packet[4] for packet in reconnected} != {original_generation + 1}:
+                raise ProtocolError("reconnect did not advance the generation")
+            result["reconnected_generation"] = original_generation + 1
     except BaseException as error:  # Relay thread failures to the test runner.
         result["error"] = error
     finally:
@@ -171,7 +299,7 @@ def _serve(listener: socket.socket, result: dict[str, Any]) -> None:
         listener.close()
 
 
-def run_handshake_test(godot: Path) -> None:
+def run_test(godot: Path, scenario: str) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -179,7 +307,7 @@ def run_handshake_test(godot: Path) -> None:
     port = listener.getsockname()[1]
 
     result: dict[str, Any] = {}
-    server = threading.Thread(target=_serve, args=(listener, result), daemon=True)
+    server = threading.Thread(target=_serve, args=(listener, result, scenario), daemon=True)
     server.start()
 
     with tempfile.TemporaryDirectory(prefix="godot-debug-v2-") as temp_directory:
@@ -187,9 +315,29 @@ def run_handshake_test(godot: Path) -> None:
         (project / "project.godot").write_text(
             '[application]\nconfig/name="debug-v2-handshake"\n', encoding="utf-8"
         )
-        (project / "main.gd").write_text(
-            "extends SceneTree\nfunc _init():\n    quit()\n", encoding="utf-8"
-        )
+        if scenario in ("control", "timeout"):
+            script = (
+                "extends SceneTree\n"
+                "var total = 0\n"
+                "func _init():\n"
+                "    call_deferred(\"_exercise\")\n"
+                "func _exercise():\n"
+                "    for index in range(1000000):\n"
+                "        total += index\n"
+                "    quit()\n"
+            )
+        elif scenario == "reconnect":
+            script = (
+                "extends SceneTree\n"
+                "func _init():\n"
+                "    call_deferred(\"_wait\")\n"
+                "func _wait():\n"
+                "    yield(create_timer(0.75), \"timeout\")\n"
+                "    quit()\n"
+            )
+        else:
+            script = "extends SceneTree\nfunc _init():\n    quit()\n"
+        (project / "main.gd").write_text(script, encoding="utf-8")
         command = [
             str(godot),
             "--path",
@@ -214,14 +362,38 @@ def run_handshake_test(godot: Path) -> None:
         )
 
     session_id = result["hellos"][0][3]
-    print(f"debug protocol v2 dual-channel handshake: PASS (session={session_id})")
+    if scenario == "control":
+        recovery_msec = (time.perf_counter() - result["control_closed_at"]) * 1000.0
+        if recovery_msec >= 1250.0:
+            raise ProtocolError(f"control disconnect recovery took {recovery_msec:.2f} ms")
+        print(
+            "debug protocol v2 execution control: PASS "
+            f"(ack_p95={result['ack_p95_msec']:.2f} ms, recovery={recovery_msec:.2f} ms)"
+        )
+    elif scenario == "timeout":
+        print(
+            "debug protocol v2 heartbeat recovery: PASS "
+            f"(recovery={result['timeout_recovery_msec']:.2f} ms)"
+        )
+    elif scenario == "reconnect":
+        print(
+            "debug protocol v2 nonblocking reconnect: PASS "
+            f"(generation={result['reconnected_generation']})"
+        )
+    else:
+        print(f"debug protocol v2 dual-channel handshake: PASS (session={session_id})")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--godot", required=True, type=Path)
+    parser.add_argument(
+        "--scenario",
+        choices=("handshake", "control", "timeout", "reconnect"),
+        default="handshake",
+    )
     arguments = parser.parse_args()
-    run_handshake_test(arguments.godot.resolve())
+    run_test(arguments.godot.resolve(), arguments.scenario)
     return 0
 
 

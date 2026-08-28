@@ -61,7 +61,11 @@ void ScriptDebuggerRemote::_send_video_memory() {
 }
 
 Error ScriptDebuggerRemote::connect_to_host(const String &p_host, uint16_t p_port) {
-	return transport.connect_to_host(p_host, p_port);
+	Error error = transport.connect_to_host(p_host, p_port);
+	if (error == OK) {
+		session.connected(transport.get_generation(), OS::get_singleton()->get_ticks_msec());
+	}
+	return error;
 }
 
 void ScriptDebuggerRemote::_put_variable(const String &p_name, const Variant &p_variable) {
@@ -107,10 +111,17 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		OS::get_singleton()->enable_for_stealing_focus(allow_focus_steal_pid);
 	}
 
-	packet_peer_stream->put_var("debug_enter");
-	packet_peer_stream->put_var(2);
-	packet_peer_stream->put_var(p_can_continue);
-	packet_peer_stream->put_var(p_script->debug_get_error());
+	const uint64_t stop_id = session.enter_paused(p_can_continue, OS::get_singleton()->get_ticks_msec());
+	Array stopped_payload;
+	stopped_payload.push_back(p_can_continue);
+	stopped_payload.push_back(p_script->debug_get_error());
+	stopped_payload.push_back(p_is_error_breakpoint);
+	if (transport.send_control("stopped", stopped_payload, 0, stop_id) != OK) {
+		session.control_lost();
+		set_depth(-1);
+		set_lines_left(-1);
+		return;
+	}
 
 	skip_profile_frame = true; // to avoid super long frame time for the frame
 
@@ -119,214 +130,84 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		Input::get_singleton()->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
 	}
 
-	uint64_t loop_begin_usec = 0;
-	uint64_t loop_time_sec = 0;
+	bool resumed = false;
+	uint64_t last_draw_usec = OS::get_singleton()->get_ticks_usec();
 	while (true) {
-		loop_begin_usec = OS::get_singleton()->get_ticks_usec();
+		const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
+		if (!transport.is_control_connected() || session.heartbeat_expired(now_msec, transport.get_heartbeat_timeout_msec())) {
+			if (transport.is_control_connected()) {
+				Array diagnostic;
+				diagnostic.push_back("control_timeout_auto_continue");
+				transport.send_control("diagnostic", diagnostic, 0, stop_id);
+			}
+			WARN_PRINT("Debugger v2 control channel was lost or timed out while paused; automatically continuing the game.");
+			session.control_lost();
+			set_depth(-1);
+			set_lines_left(-1);
+			break;
+		}
 
-		_get_output();
-
-		if (packet_peer_stream->get_available_packet_count() > 0) {
-			Variant var;
-			Error err = packet_peer_stream->get_var(var);
-
-			ERR_CONTINUE(err != OK);
-			ERR_CONTINUE(var.get_type() != Variant::ARRAY);
-
-			Array cmd = var;
-
-			ERR_CONTINUE(cmd.size() == 0);
-			ERR_CONTINUE(cmd[0].get_type() != Variant::STRING);
-
-			String command = cmd[0];
-
-			if (command == "get_stack_dump") {
-				packet_peer_stream->put_var("stack_dump");
-				int slc = p_script->debug_get_stack_level_count();
-				packet_peer_stream->put_var(slc);
-
-				for (int i = 0; i < slc; i++) {
-					Dictionary d;
-					d["file"] = p_script->debug_get_stack_level_source(i);
-					d["line"] = p_script->debug_get_stack_level_line(i);
-					d["function"] = p_script->debug_get_stack_level_function(i);
-					//d["id"]=p_script->debug_get_stack_level_
-					d["id"] = 0;
-
-					packet_peer_stream->put_var(d);
-				}
-
-			} else if (command == "get_stack_frame_vars") {
-				cmd.remove(0);
-				ERR_CONTINUE(cmd.size() != 1);
-				int lv = cmd[0];
-
-				List<String> members;
-				List<Variant> member_vals;
-				if (ScriptInstance *inst = p_script->debug_get_stack_level_instance(lv)) {
-					members.push_back("self");
-					member_vals.push_back(inst->get_owner());
-				}
-				p_script->debug_get_stack_level_members(lv, &members, &member_vals);
-				ERR_CONTINUE(members.size() != member_vals.size());
-
-				List<String> locals;
-				List<Variant> local_vals;
-				p_script->debug_get_stack_level_locals(lv, &locals, &local_vals);
-				ERR_CONTINUE(locals.size() != local_vals.size());
-
-				List<String> globals;
-				List<Variant> globals_vals;
-				p_script->debug_get_globals(&globals, &globals_vals);
-				ERR_CONTINUE(globals.size() != globals_vals.size());
-
-				packet_peer_stream->put_var("stack_frame_vars");
-				packet_peer_stream->put_var(3 + (locals.size() + members.size() + globals.size()) * 2);
-
-				{ //locals
-					packet_peer_stream->put_var(locals.size());
-
-					List<String>::Element *E = locals.front();
-					List<Variant>::Element *F = local_vals.front();
-
-					while (E) {
-						_put_variable(E->get(), F->get());
-
-						E = E->next();
-						F = F->next();
-					}
-				}
-
-				{ //members
-					packet_peer_stream->put_var(members.size());
-
-					List<String>::Element *E = members.front();
-					List<Variant>::Element *F = member_vals.front();
-
-					while (E) {
-						_put_variable(E->get(), F->get());
-
-						E = E->next();
-						F = F->next();
-					}
-				}
-
-				{ //globals
-					packet_peer_stream->put_var(globals.size());
-
-					List<String>::Element *E = globals.front();
-					List<Variant>::Element *F = globals_vals.front();
-
-					while (E) {
-						_put_variable(E->get(), F->get());
-
-						E = E->next();
-						F = F->next();
-					}
-				}
-
-			} else if (command == "step") {
+		DebugProtocolV2::Envelope message;
+		Error poll_error = transport.poll_control(message);
+		if (poll_error == OK) {
+			DebugSessionV2::Action action = _handle_control_message(message);
+			if (action == DebugSessionV2::ACTION_STEP) {
 				set_depth(-1);
 				set_lines_left(1);
-				break;
-			} else if (command == "next") {
+				resumed = true;
+			} else if (action == DebugSessionV2::ACTION_NEXT) {
 				set_depth(0);
 				set_lines_left(1);
-				break;
-
-			} else if (command == "continue") {
+				resumed = true;
+			} else if (action == DebugSessionV2::ACTION_CONTINUE) {
 				set_depth(-1);
 				set_lines_left(-1);
 				OS::get_singleton()->move_window_to_foreground();
-				break;
-			} else if (command == "break") {
-				ERR_PRINT("Got break when already broke!");
-				break;
-			} else if (command == "request_scene_tree") {
-#ifdef DEBUG_ENABLED
-				if (scene_tree) {
-					scene_tree->_debugger_request_tree();
-				}
-#endif
-			} else if (command == "request_video_mem") {
-				_send_video_memory();
-			} else if (command == "inspect_object") {
-				ObjectID id = cmd[1];
-				_send_object_id(id);
-			} else if (command == "set_object_property") {
-				_set_object_property(cmd[1], cmd[2], cmd[3]);
-
-			} else if (command == "override_camera_2D:set") {
-				bool enforce = cmd[1];
-
-				if (scene_tree) {
-					scene_tree->get_root()->enable_canvas_transform_override(enforce);
-				}
-			} else if (command == "override_camera_2D:transform") {
-				Transform2D transform = cmd[1];
-
-				if (scene_tree) {
-					scene_tree->get_root()->set_canvas_transform_override(transform);
-				}
-			} else if (command == "override_camera_3D:set") {
-				bool enable = cmd[1];
-
-				if (scene_tree) {
-					scene_tree->get_root()->enable_camera_override(enable);
-				}
-			} else if (command == "override_camera_3D:transform") {
-				Transform transform = cmd[1];
-				bool is_perspective = cmd[2];
-				float size_or_fov = cmd[3];
-				float near = cmd[4];
-				float far = cmd[5];
-
-				if (scene_tree) {
-					if (is_perspective) {
-						scene_tree->get_root()->set_camera_override_perspective(size_or_fov, near, far);
-					} else {
-						scene_tree->get_root()->set_camera_override_orthogonal(size_or_fov, near, far);
-					}
-					scene_tree->get_root()->set_camera_override_transform(transform);
-				}
-
-			} else if (command == "reload_scripts") {
-				reload_all_scripts = true;
-			} else if (command == "breakpoint") {
-				bool set = cmd[3];
-				if (set) {
-					insert_breakpoint(cmd[2], cmd[1]);
-				} else {
-					remove_breakpoint(cmd[2], cmd[1]);
-				}
-
-			} else if (command == "save_node") {
-				_save_node(cmd[1], cmd[2]);
-			} else if (command == "set_skip_breakpoints") {
-				skip_breakpoints = cmd[1];
-			} else {
-				_parse_live_edit(cmd);
+				resumed = true;
 			}
-
+			if (resumed) {
+				session.mark_running(now_msec);
+				Array running_payload;
+				running_payload.push_back(DebugProtocolV2::state_to_string(session.get_state()));
+				transport.send_control("running", running_payload, message.request_id, stop_id);
+				break;
+			}
+		} else if (poll_error != ERR_UNAVAILABLE) {
+			continue;
 		} else {
-			OS::get_singleton()->delay_usec(10000);
-			OS::get_singleton()->process_and_drop_events();
+			OS::get_singleton()->delay_usec(1000);
 		}
 
-		// This is for the camera override to stay live even when the game is paused from the editor
-		loop_time_sec = (OS::get_singleton()->get_ticks_usec() - loop_begin_usec) / 1000000.0f;
-		VisualServer::get_singleton()->sync();
-		if (VisualServer::get_singleton()->has_changed()) {
-			VisualServer::get_singleton()->draw(true, loop_time_sec * Engine::get_singleton()->get_time_scale());
+		OS::get_singleton()->process_and_drop_events();
+		const uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
+		if (now_usec - last_draw_usec >= 16000) {
+			const float elapsed_seconds = (now_usec - last_draw_usec) / 1000000.0f;
+			last_draw_usec = now_usec;
+			VisualServer::get_singleton()->sync();
+			if (VisualServer::get_singleton()->has_changed()) {
+				VisualServer::get_singleton()->draw(true, elapsed_seconds * Engine::get_singleton()->get_time_scale());
+			}
 		}
 	}
-
-	packet_peer_stream->put_var("debug_exit");
-	packet_peer_stream->put_var(0);
 
 	if (mouse_mode != Input::MOUSE_MODE_VISIBLE) {
 		Input::get_singleton()->set_mouse_mode(mouse_mode);
 	}
+}
+
+void ScriptDebuggerRemote::_send_control_ack(const DebugSessionV2::Decision &p_decision) {
+	Array payload;
+	payload.push_back(p_decision.accepted);
+	payload.push_back(p_decision.duplicate);
+	payload.push_back(p_decision.reason);
+	payload.push_back(DebugProtocolV2::state_to_string(session.get_state()));
+	transport.send_control("ack", payload, p_decision.request_id, p_decision.stop_id);
+}
+
+DebugSessionV2::Action ScriptDebuggerRemote::_handle_control_message(const DebugProtocolV2::Envelope &p_message) {
+	DebugSessionV2::Decision decision = session.handle_control(p_message, OS::get_singleton()->get_ticks_msec());
+	_send_control_ack(decision);
+	return decision.action;
 }
 
 void ScriptDebuggerRemote::_get_output() {
@@ -676,6 +557,26 @@ void ScriptDebuggerRemote::_set_object_property(ObjectID p_id, const String &p_p
 void ScriptDebuggerRemote::_poll_events() {
 	//this si called from ::idle_poll, happens only when running the game,
 	//does not get called while on debug break
+	while (transport.is_control_connected()) {
+		DebugProtocolV2::Envelope message;
+		Error error = transport.poll_control(message);
+		if (error == ERR_UNAVAILABLE) {
+			break;
+		}
+		if (error != OK) {
+			continue;
+		}
+
+		DebugSessionV2::Action action = _handle_control_message(message);
+		if (action == DebugSessionV2::ACTION_PAUSE && get_break_language()) {
+			debug(get_break_language());
+			return;
+		}
+	}
+
+	if (!transport.is_data_connected()) {
+		return;
+	}
 
 	while (packet_peer_stream->get_available_packet_count() > 0) {
 		_get_output();
@@ -883,6 +784,27 @@ void ScriptDebuggerRemote::_send_profiling_data(bool p_for_frame) {
 void ScriptDebuggerRemote::idle_poll() {
 	// this function is called every frame, except when there is a debugger break (::debug() in this class)
 	// execution stops and remains in the ::debug function
+	if (!transport.is_connected()) {
+		const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
+		if (transport.is_reconnecting()) {
+			Error reconnect_error = transport.poll_reconnect();
+			if (reconnect_error == OK) {
+				session.connected(transport.get_generation(), now_msec);
+			} else if (reconnect_error != ERR_BUSY) {
+				next_reconnect_msec = now_msec + 250;
+			}
+		} else {
+			_poll_events();
+			if (!transport.is_connected() && now_msec >= next_reconnect_msec) {
+				session.control_lost();
+				Error reconnect_error = transport.start_reconnect();
+				if (reconnect_error != ERR_BUSY) {
+					next_reconnect_msec = now_msec + 250;
+				}
+			}
+		}
+		return;
+	}
 
 	_get_output();
 
@@ -1175,6 +1097,7 @@ ScriptDebuggerRemote::ScriptDebuggerRemote() :
 		allow_focus_steal_pid(0),
 		locking(false),
 		poll_every(0),
+		next_reconnect_msec(0),
 		scene_tree(nullptr) {
 	phl.printfunc = _print_handler;
 	phl.userdata = this;

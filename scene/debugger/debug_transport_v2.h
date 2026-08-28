@@ -50,6 +50,11 @@ class DebugTransportV2 {
 	uint32_t heartbeat_interval_msec = 250;
 	uint32_t heartbeat_timeout_msec = 1000;
 	uint32_t variable_page_size = 100;
+	bool reconnecting = false;
+	bool reconnect_hello_sent = false;
+	bool reconnect_control_ack = false;
+	bool reconnect_data_ack = false;
+	uint64_t reconnect_started_msec = 0;
 
 	static uint64_t _make_session_id();
 	Error _wait_for_connections(uint32_t p_timeout_msec);
@@ -58,6 +63,8 @@ class DebugTransportV2 {
 
 public:
 	Error connect_to_host(const String &p_host, uint16_t p_port, uint32_t p_timeout_msec = 5000);
+	Error start_reconnect();
+	Error poll_reconnect(uint32_t p_timeout_msec = 5000);
 	void disconnect();
 
 	Error send_control(const String &p_type, const Array &p_payload = Array(), uint64_t p_request_id = 0, uint64_t p_stop_id = 0);
@@ -68,6 +75,7 @@ public:
 	bool is_control_connected() const;
 	bool is_data_connected() const;
 	bool is_connected() const;
+	bool is_reconnecting() const { return reconnecting; }
 
 	uint64_t get_session_id() const { return session_id; }
 	uint32_t get_generation() const { return generation; }
