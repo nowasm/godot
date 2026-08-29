@@ -104,6 +104,9 @@ void ScriptDebuggerRemote::_save_node(ObjectID id, const String &p_path) {
 void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, bool p_is_error_breakpoint) {
 	//this function is called when there is a debugger break (bug on script)
 	//or when execution is paused from editor
+	// A stop reached through any path other than the one-shot return hook must
+	// cancel Step Out so it cannot trigger again after the next resume.
+	set_break_on_function_return(false);
 	// Protocol v2 never enters a terminal pause for an error the VM cannot
 	// resume from. Older frontends exposed a disabled Continue button here,
 	// leaving the game alive but permanently frozen.
@@ -148,6 +151,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		session.control_lost();
 		set_depth(-1);
 		set_lines_left(-1);
+		set_break_on_function_return(false);
 		return;
 	}
 
@@ -175,6 +179,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 			variable_store.invalidate();
 			set_depth(-1);
 			set_lines_left(-1);
+			set_break_on_function_return(false);
 			break;
 		}
 
@@ -183,14 +188,22 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		if (poll_error == OK) {
 			DebugSessionV2::Action action = _handle_control_message(message);
 			if (action == DebugSessionV2::ACTION_STEP) {
+				set_break_on_function_return(false);
 				set_depth(-1);
 				set_lines_left(1);
 				resumed = true;
 			} else if (action == DebugSessionV2::ACTION_NEXT) {
+				set_break_on_function_return(false);
 				set_depth(0);
 				set_lines_left(1);
 				resumed = true;
+			} else if (action == DebugSessionV2::ACTION_STEP_OUT) {
+				set_depth(1);
+				set_lines_left(1);
+				set_break_on_function_return(true);
+				resumed = true;
 			} else if (action == DebugSessionV2::ACTION_CONTINUE) {
+				set_break_on_function_return(false);
 				set_depth(-1);
 				set_lines_left(-1);
 				OS::get_singleton()->move_window_to_foreground();
