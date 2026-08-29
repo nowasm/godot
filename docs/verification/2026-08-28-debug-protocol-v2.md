@@ -6,10 +6,10 @@ Verified on Windows 11 on 2026-08-29 (Asia/Shanghai). The implementation intenti
 
 | Artifact | Source revision | Size | SHA-256 |
 | --- | --- | ---: | --- |
-| `D:\devlib\godot\godot-debug-v2\bin\godot.windows.opt.tools.64.exe` | Godot `593813e3c42dc67a23cfd1ae8de3b2b1cc6f4ceb` | 70,989,312 bytes | `5C6A411073817D3D96CB17DE1A4443422318CC3FC78D9CFCB39C3D03F390DEA9` |
+| `D:\devlib\godot\godot-debug-v2\bin\godot.windows.opt.tools.64.exe` | Godot `1fb92b2693f513be473422469f657f500357b094` | 70,988,800 bytes | `287F1E49ECE34762423B294E99E252799D1155682471618B193D436907204547` |
 | `D:\work_mine\godot\GodotTools-debug-v2\godparty-godot-tools-0.1.0.vsix` | GodotTools `05fc0575489c221086d9a2c1dc3aac2b9bb76693` | 916,215 bytes | `ACB1EE15FD57C0E5F1EDCA3E25B39559EA8E7BF8C4CF40F735D046A61D8C462D` |
 
-The engine reports `3.6.3.stable.custom_build.593813e3c`. The VSIX was installed with `code --install-extension ... --force`, and the installed bundle was checked for the `GDDBG2` protocol marker.
+The engine reports `3.6.3.stable.custom_build.1fb92b269`. The VSIX was installed with `code --install-extension ... --force`, and the installed bundle was checked for the `GDDBG2` protocol marker.
 
 ## Automated integration gate
 
@@ -22,19 +22,25 @@ python misc\debugger_v2\run_integration_tests.py `
   --report misc\debugger_v2\integration-latest.json
 ```
 
-All 12 gates passed. The run covered protocol/state models, dual-channel handshake, 100 engine steps, heartbeat timeout, reconnect, data-only disconnect, lazy variables, output backpressure, the custom Godot editor, TypeScript codec/state tests, and a real VS Code extension-host session.
+All 13 gates passed. The run covered protocol/state models, dual-channel handshake, 100 engine steps, heartbeat timeout, reconnect, data-only disconnect, lazy variables, output backpressure, executable-line stepping, the custom Godot editor, TypeScript codec/state tests, and a real VS Code extension-host session.
 
 | Gate | Result |
 | --- | --- |
-| Engine command ACK P95 | 2.35 ms |
+| Engine command ACK P95 | 2.51 ms |
 | Engine control-disconnect recovery | 152.01 ms |
 | Heartbeat recovery | 1001.49 ms |
 | Lazy stack / 100-item page | 1.26 ms / 2.30 ms |
 | Backpressure ACK / next-stop P95 | 2.20 ms / 2.39 ms |
 | Backpressure drops | 769 data messages; no control messages |
 | Godot editor | 101 stops completed |
-| VS Code ACK P50 / P95 / max | 7.13 / 13.25 / 21.18 ms |
-| VS Code next-stop P50 / P95 / max | 10.47 / 21.62 / 49.71 ms |
+| VS Code ACK P50 / P95 / max | 6.99 / 14.38 / 40.27 ms |
+| VS Code next-stop P50 / P95 / max | 12.10 / 27.88 / 44.12 ms |
+
+## Executable-line stepping
+
+`GDScriptCompiler::_parse_block` now emits `OPCODE_LINE` from executable AST statement nodes instead of physical newline nodes. Blank lines and comment-only lines therefore do not consume a step; inline-comment statements remain stoppable, and multiple statements on one physical line share one stop.
+
+The real protocol-v2 fixture starts at an external breakpoint and records the top stack frame after every acknowledged `next`. Its exact stop sequence was `[9, 14, 15, 19, 20, 21]`, skipping consecutive blank/comment-only regions at both the function and nested branch levels.
 
 The local requirements were ACK P95 <= 100 ms, next-stop P95 <= 300 ms, disconnect recovery < 1.25 seconds, a bounded 262,144-byte data queue, no dropped control messages, and no permanent pause after frontend loss.
 
@@ -54,9 +60,9 @@ The harness executes the recovered project with isolated user-data directories. 
 
 | Target | Steps | ACK P50 / P95 / max | Next-stop P50 / P95 / max |
 | --- | ---: | --- | --- |
-| Main initialization | 50 | 1.894 / 2.203 / 2.638 ms | 1.934 / 2.232 / 2.675 ms |
-| Entity birth | 50 | 1.961 / 2.104 / 2.622 ms | 1.997 / 2.146 / 2.663 ms |
-| Combat damage | 50 | 1.941 / 2.122 / 2.543 ms | 1.971 / 2.149 / 2.576 ms |
+| Main initialization | 50 | 1.981 / 2.118 / 2.201 ms | 1.998 / 2.160 / 2.225 ms |
+| Entity birth | 50 | 1.959 / 2.131 / 2.647 ms | 1.980 / 2.148 / 2.708 ms |
+| Combat damage | 50 | 1.976 / 2.078 / 2.434 ms | 1.994 / 2.117 / 2.461 ms |
 
 For every target, the scene revision was 1, the dictionary total/page were 10,000/100, the queue remained at 33,728 of 262,144 bytes, and 3,841 low-priority messages were deliberately dropped without losing control traffic. Data-channel reconnect advanced the generation to 2. Closing the control channel while paused resumed the game in about 152 ms; withholding heartbeats recovered in about 1.0 second.
 
@@ -64,6 +70,7 @@ For every target, the scene revision was 1, the dictionary total/page were 10,00
 
 - `npm run compile`: passed.
 - Godot 3 v2 TypeScript tests: 7/7 passed.
+- Godot 3 executable-line stepping: exact stop sequence 6/6 passed.
 - Godot 3 real VS Code DAP test: 100/100 acknowledged steps passed.
 - Godot 4 variable-model unit tests: 14/14 passed.
 - `npm run test:godot4:integration` with Godot 4.6.2: 8/8 real DAP tests passed.
@@ -82,4 +89,3 @@ The repository-wide `npm test` command is not a release gate because its single 
 - Godot 3 `stepOut` currently maps to the engine's acknowledged `next` operation.
 - A data-only loss while paused does not force the game to resume; the independent control channel remains usable, and reconnect begins after execution resumes. Control loss or heartbeat loss always auto-resumes.
 - Non-continuable VM errors are reported with their stack but no longer create a terminal pause that cannot accept Continue.
-
