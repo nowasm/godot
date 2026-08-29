@@ -104,6 +104,27 @@ void ScriptDebuggerRemote::_save_node(ObjectID id, const String &p_path) {
 void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, bool p_is_error_breakpoint) {
 	//this function is called when there is a debugger break (bug on script)
 	//or when execution is paused from editor
+	// Protocol v2 never enters a terminal pause for an error the VM cannot
+	// resume from. Older frontends exposed a disabled Continue button here,
+	// leaving the game alive but permanently frozen.
+	if (p_is_error_breakpoint && !p_can_continue) {
+		if (transport.is_data_connected()) {
+			Array payload;
+			payload.push_back(p_script->debug_get_error());
+			Array frames;
+			const int frame_count = p_script->debug_get_stack_level_count();
+			for (int frame = 0; frame < frame_count; frame++) {
+				Array descriptor;
+				descriptor.push_back(p_script->debug_get_stack_level_source(frame));
+				descriptor.push_back(p_script->debug_get_stack_level_line(frame));
+				descriptor.push_back(p_script->debug_get_stack_level_function(frame));
+				frames.push_back(descriptor);
+			}
+			payload.push_back(frames);
+			transport.send_data("noncontinuable_error", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
+		}
+		return;
+	}
 
 	if (skip_breakpoints && !p_is_error_breakpoint) {
 		return;
