@@ -13,7 +13,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCENARIOS = ("handshake", "control", "timeout", "reconnect", "data_disconnect", "lazy", "backpressure")
+SCENARIOS = (
+    "handshake",
+    "control",
+    "timeout",
+    "reconnect",
+    "data_disconnect",
+    "lazy",
+    "backpressure",
+    "executable_lines",
+)
 
 
 def print_output(output: str) -> None:

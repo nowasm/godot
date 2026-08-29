@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import select
 import socket
 import struct
 import subprocess
@@ -24,6 +25,8 @@ TYPE_INT = 2
 TYPE_STRING = 4
 TYPE_ARRAY = 19
 FLAG_64 = 1 << 16
+
+EXECUTABLE_LINE_STOPS = [9, 14, 15, 19, 20, 21]
 
 
 class ProtocolError(RuntimeError):
@@ -383,6 +386,110 @@ def _exercise_backpressure(
     control.close()
 
 
+def _request_top_frame_line(
+    data: socket.socket,
+    data_hello: list[Any],
+    sequence: int,
+    request_id: int,
+    stop_id: int,
+) -> int:
+    _send_packet(
+        data,
+        _command(data_hello, sequence, request_id, stop_id, "stack_trace", [0, 1]),
+    )
+    stack = _receive_envelope(data, "stack_trace_result")[10]
+    frames = stack[1]
+    if not frames:
+        raise ProtocolError("executable-line stop did not provide a stack frame")
+    return int(frames[0][2])
+
+
+def _exercise_executable_lines(
+    control: socket.socket,
+    data: socket.socket,
+    control_hello: list[Any],
+    data_hello: list[Any],
+    result: dict[str, Any],
+) -> None:
+    stopped = None
+    diagnostics: list[Any] = []
+    deadline = time.monotonic() + 3.0
+    while stopped is None and time.monotonic() < deadline:
+        readable, _, _ = select.select([control, data], [], [], 0.25)
+        for connection in readable:
+            packet = _receive_packet(connection)
+            if not isinstance(packet, list) or len(packet) != 11:
+                continue
+            if packet[9] == "stopped":
+                stopped = packet
+            elif packet[9] in ("error", "noncontinuable_error", "diagnostic", "output"):
+                diagnostics.append([packet[9], packet[10]])
+    if stopped is None:
+        raise ProtocolError(
+            f"executable-line fixture did not stop; diagnostics={diagnostics}"
+        )
+    stop_id = stopped[8]
+    control_sequence = 2
+    data_sequence = 2
+    request_id = 10
+    data_request_id = 100
+    actual = [
+        _request_top_frame_line(
+            data, data_hello, data_sequence, data_request_id, stop_id
+        )
+    ]
+
+    for _ in range(len(EXECUTABLE_LINE_STOPS) - 1):
+        _send_packet(
+            control,
+            _command(
+                control_hello,
+                control_sequence,
+                request_id,
+                stop_id,
+                "next",
+            ),
+        )
+        _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
+        _receive_envelope(control, "running")
+        try:
+            stopped = _receive_envelope(control, "stopped")
+        except ProtocolError as error:
+            raise ProtocolError(
+                f"fixture exited before the expected stop sequence; stops={actual}"
+            ) from error
+        stop_id = stopped[8]
+        control_sequence += 1
+        request_id += 1
+        data_sequence += 1
+        data_request_id += 1
+        actual.append(
+            _request_top_frame_line(
+                data, data_hello, data_sequence, data_request_id, stop_id
+            )
+        )
+
+    result["executable_line_stops"] = actual
+    if actual != EXECUTABLE_LINE_STOPS:
+        raise ProtocolError(
+            "step sequence included a non-executable line: "
+            f"expected {EXECUTABLE_LINE_STOPS}, got {actual}"
+        )
+
+    _send_packet(
+        control,
+        _command(
+            control_hello,
+            control_sequence,
+            request_id,
+            stop_id,
+            "continue",
+        ),
+    )
+    _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
+    _receive_envelope(control, "running")
+
+
 def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> None:
     connections: list[socket.socket] = []
     try:
@@ -467,6 +574,16 @@ def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> No
                 result,
             )
             connections.pop(control_index)
+        elif scenario == "executable_lines":
+            control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
+            data_index = next(index for index, hello in enumerate(hellos) if hello[9] == "data_hello")
+            _exercise_executable_lines(
+                connections[control_index],
+                connections[data_index],
+                hellos[control_index],
+                hellos[data_index],
+                result,
+            )
     except BaseException as error:  # Relay thread failures to the test runner.
         result["error"] = error
     finally:
@@ -528,6 +645,9 @@ def run_test(godot: Path, scenario: str) -> None:
                 "    yield(create_timer(0.75), \"timeout\")\n"
                 "    quit()\n"
             )
+        elif scenario == "executable_lines":
+            script_path = Path(__file__).resolve().parent / "fixtures" / "executable_lines" / "main.gd"
+            script = script_path.read_text(encoding="utf-8")
         else:
             script = "extends SceneTree\nfunc _init():\n    quit()\n"
         (project / "main.gd").write_text(script, encoding="utf-8")
@@ -537,9 +657,10 @@ def run_test(godot: Path, scenario: str) -> None:
             str(project),
             "--remote-debug",
             f"127.0.0.1:{port}",
-            "--script",
-            "main.gd",
         ]
+        if scenario == "executable_lines":
+            command.extend(["--breakpoints", "res://main.gd:9"])
+        command.extend(["--script", "main.gd"])
         completed = subprocess.run(
             command, capture_output=True, text=True, timeout=15.0, check=False
         )
@@ -548,7 +669,10 @@ def run_test(godot: Path, scenario: str) -> None:
     if server.is_alive():
         raise ProtocolError("fake server did not finish")
     if "error" in result:
-        raise result["error"]
+        raise ProtocolError(
+            f"{result['error']}\nGodot stdout:\n{completed.stdout}\n"
+            f"Godot stderr:\n{completed.stderr}"
+        ) from result["error"]
     if completed.returncode != 0:
         raise ProtocolError(
             f"Godot exited with {completed.returncode}:\n{completed.stdout}\n{completed.stderr}"
@@ -593,6 +717,11 @@ def run_test(godot: Path, scenario: str) -> None:
             f"stop_p95={result['pressure_stop_p95_msec']:.2f} ms, "
             f"dropped={result['pressure_dropped']})"
         )
+    elif scenario == "executable_lines":
+        print(
+            "debug protocol v2 executable-line stepping: PASS "
+            f"(stops={result['executable_line_stops']})"
+        )
     else:
         print(f"debug protocol v2 dual-channel handshake: PASS (session={session_id})")
 
@@ -602,7 +731,7 @@ def main() -> int:
     parser.add_argument("--godot", required=True, type=Path)
     parser.add_argument(
         "--scenario",
-        choices=("handshake", "control", "timeout", "reconnect", "data_disconnect", "lazy", "backpressure"),
+        choices=("handshake", "control", "timeout", "reconnect", "data_disconnect", "lazy", "backpressure", "executable_lines"),
         default="handshake",
     )
     arguments = parser.parse_args()
