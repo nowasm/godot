@@ -139,7 +139,7 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 
 	void _set_object_property(ObjectID p_id, const String &p_property, const Variant &p_value);
 
-	void _send_object_id(ObjectID p_id);
+	bool _send_object_id(ObjectID p_id, uint64_t p_request_id, uint64_t p_stop_id);
 	void _send_video_memory(uint64_t p_request_id = 0, uint64_t p_stop_id = 0);
 
 	Ref<MultiplayerAPI> multiplayer;

@@ -329,6 +329,12 @@ bool ScriptDebuggerRemote::_poll_data_request(ScriptLanguage *p_script) {
 #endif
 		return true;
 	}
+	if (request.type == "inspect_object_id" && request.payload.size() >= 1) {
+		if (!_send_object_id((ObjectID)(int64_t)request.payload[0], request.request_id, request.stop_id)) {
+			_send_data_error(request, "object_unavailable", "The requested remote object no longer exists.");
+		}
+		return true;
+	}
 	if (request.stop_id != session.get_current_stop_id() || variable_store.get_active_stop_id() != session.get_current_stop_id()) {
 		_send_data_error(request, "stale_stop_id", "The requested debugger stop is no longer active.");
 		return true;
@@ -616,10 +622,10 @@ bool ScriptDebuggerRemote::_parse_live_edit(const Array &p_command) {
 #endif
 }
 
-void ScriptDebuggerRemote::_send_object_id(ObjectID p_id) {
+bool ScriptDebuggerRemote::_send_object_id(ObjectID p_id, uint64_t p_request_id, uint64_t p_stop_id) {
 	Object *obj = ObjectDB::get_instance(p_id);
 	if (!obj) {
-		return;
+		return false;
 	}
 
 	typedef Pair<PropertyInfo, Variant> PropertyDesc;
@@ -746,11 +752,12 @@ void ScriptDebuggerRemote::_send_object_id(ObjectID p_id) {
 		send_props.push_back(prop);
 	}
 
-	packet_peer_stream->put_var("message:inspect_object");
-	packet_peer_stream->put_var(3);
-	packet_peer_stream->put_var(p_id);
-	packet_peer_stream->put_var(obj->get_class());
-	packet_peer_stream->put_var(send_props);
+	Array payload;
+	payload.push_back((int64_t)p_id);
+	payload.push_back(obj->get_class());
+	payload.push_back(send_props);
+	transport.send_data("inspect_object_id_result", payload, p_request_id, p_stop_id, DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
+	return true;
 }
 
 void ScriptDebuggerRemote::_set_object_property(ObjectID p_id, const String &p_property, const Variant &p_value) {
