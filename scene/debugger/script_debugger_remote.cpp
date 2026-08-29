@@ -41,7 +41,7 @@
 #include "scene/resources/packed_scene.h"
 #include "servers/visual_server.h"
 
-void ScriptDebuggerRemote::_send_video_memory() {
+void ScriptDebuggerRemote::_send_video_memory(uint64_t p_request_id, uint64_t p_stop_id) {
 	List<ResourceUsage> usage;
 	if (resource_usage_func) {
 		resource_usage_func(&usage);
@@ -60,7 +60,7 @@ void ScriptDebuggerRemote::_send_video_memory() {
 	}
 	Array payload;
 	payload.push_back(resources);
-	transport.send_data("video_memory", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
+	transport.send_data("video_memory_result", payload, p_request_id, p_stop_id, DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
 }
 
 Error ScriptDebuggerRemote::connect_to_host(const String &p_host, uint16_t p_port) {
@@ -264,6 +264,47 @@ bool ScriptDebuggerRemote::_poll_data_request(ScriptLanguage *p_script) {
 		Array payload;
 		payload.push_back(messages_to_queue);
 		transport.send_data("stress_data_queue_result", payload, request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "video_memory") {
+		_send_video_memory(request.request_id, request.stop_id);
+		return true;
+	}
+	if (request.type == "breakpoint" && request.payload.size() >= 3) {
+		const String source = request.payload[0];
+		const int line = request.payload[1];
+		const bool enabled = request.payload[2];
+		if (enabled) {
+			insert_breakpoint(line, source);
+		} else {
+			remove_breakpoint(line, source);
+		}
+		transport.send_data("breakpoint_result", Array(), request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "set_skip_breakpoints" && request.payload.size() >= 1) {
+		skip_breakpoints = request.payload[0];
+		transport.send_data("set_skip_breakpoints_result", Array(), request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "reload_scripts") {
+		reload_all_scripts = true;
+		transport.send_data("reload_scripts_result", Array(), request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "set_object_property" && request.payload.size() >= 3) {
+		_set_object_property((ObjectID)(int64_t)request.payload[0], request.payload[1], request.payload[2]);
+		transport.send_data("set_object_property_result", Array(), request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type.begins_with("live_")) {
+		Array command;
+		command.push_back(request.type);
+		for (int index = 0; index < request.payload.size(); index++) {
+			command.push_back(request.payload[index]);
+		}
+		_parse_live_edit(command);
+		transport.send_data("live_edit_result", Array(), request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
 		return true;
 	}
 	if (request.type == "export_trace") {
