@@ -404,6 +404,24 @@ def _request_top_frame_line(
     return int(frames[0][2])
 
 
+def _request_stack(
+    data: socket.socket,
+    data_hello: list[Any],
+    sequence: int,
+    request_id: int,
+    stop_id: int,
+) -> list[list[Any]]:
+    _send_packet(
+        data,
+        _command(data_hello, sequence, request_id, stop_id, "stack_trace", [0, 20]),
+    )
+    stack = _receive_envelope(data, "stack_trace_result")[10]
+    frames = stack[1]
+    if not frames:
+        raise ProtocolError("call-stepping stop did not provide a stack frame")
+    return frames
+
+
 def _exercise_executable_lines(
     control: socket.socket,
     data: socket.socket,
@@ -485,6 +503,78 @@ def _exercise_executable_lines(
             stop_id,
             "continue",
         ),
+    )
+    _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
+    _receive_envelope(control, "running")
+
+
+def _exercise_call_stepping(
+    control: socket.socket,
+    data: socket.socket,
+    control_hello: list[Any],
+    data_hello: list[Any],
+    result: dict[str, Any],
+) -> None:
+    stopped = _receive_envelope(control, "stopped")
+    stop_id = stopped[8]
+    control_sequence = 2
+    data_sequence = 2
+    request_id = 10
+    data_request_id = 100
+    actual: list[tuple[str, int]] = []
+
+    def capture(expected_function: str, expected_line: int, expected_caller: bool) -> None:
+        nonlocal data_sequence, data_request_id
+        frames = _request_stack(
+            data, data_hello, data_sequence, data_request_id, stop_id
+        )
+        top = (str(frames[0][3]), int(frames[0][2]))
+        actual.append(top)
+        if top != (expected_function, expected_line):
+            raise ProtocolError(
+                f"unexpected call-stepping stop: expected {(expected_function, expected_line)}, got {top}"
+            )
+        if expected_caller:
+            if len(frames) < 2 or str(frames[1][3]) != "_exercise" or int(frames[1][2]) != 21:
+                raise ProtocolError(f"callee stop lost its caller frame: {frames}")
+        data_sequence += 1
+        data_request_id += 1
+
+    def execute(command_name: str) -> None:
+        nonlocal stop_id, control_sequence, request_id
+        _send_packet(
+            control,
+            _command(
+                control_hello,
+                control_sequence,
+                request_id,
+                stop_id,
+                command_name,
+            ),
+        )
+        _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
+        _receive_envelope(control, "running")
+        next_stop = _receive_envelope(control, "stopped")
+        if next_stop[8] <= stop_id:
+            raise ProtocolError("stop id did not increase during call stepping")
+        stop_id = next_stop[8]
+        control_sequence += 1
+        request_id += 1
+
+    capture("_exercise", 21, False)
+    for function_name, function_line in (("first", 9), ("second", 13), ("combine", 17)):
+        execute("step")
+        capture(function_name, function_line, True)
+        execute("step_out")
+        capture("_exercise", 21, False)
+
+    execute("next")
+    capture("_exercise", 22, False)
+    result["call_stepping_stops"] = actual
+
+    _send_packet(
+        control,
+        _command(control_hello, control_sequence, request_id, stop_id, "continue"),
     )
     _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
     _receive_envelope(control, "running")
@@ -584,6 +674,16 @@ def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> No
                 hellos[data_index],
                 result,
             )
+        elif scenario == "call_stepping":
+            control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
+            data_index = next(index for index, hello in enumerate(hellos) if hello[9] == "data_hello")
+            _exercise_call_stepping(
+                connections[control_index],
+                connections[data_index],
+                hellos[control_index],
+                hellos[data_index],
+                result,
+            )
     except BaseException as error:  # Relay thread failures to the test runner.
         result["error"] = error
     finally:
@@ -648,6 +748,9 @@ def run_test(godot: Path, scenario: str) -> None:
         elif scenario == "executable_lines":
             script_path = Path(__file__).resolve().parent / "fixtures" / "executable_lines" / "main.gd"
             script = script_path.read_text(encoding="utf-8")
+        elif scenario == "call_stepping":
+            script_path = Path(__file__).resolve().parent / "fixtures" / "call_stepping" / "main.gd"
+            script = script_path.read_text(encoding="utf-8")
         else:
             script = "extends SceneTree\nfunc _init():\n    quit()\n"
         (project / "main.gd").write_text(script, encoding="utf-8")
@@ -660,6 +763,8 @@ def run_test(godot: Path, scenario: str) -> None:
         ]
         if scenario == "executable_lines":
             command.extend(["--breakpoints", "res://main.gd:9"])
+        elif scenario == "call_stepping":
+            command.extend(["--breakpoints", "res://main.gd:21"])
         command.extend(["--script", "main.gd"])
         completed = subprocess.run(
             command, capture_output=True, text=True, timeout=15.0, check=False
@@ -722,6 +827,11 @@ def run_test(godot: Path, scenario: str) -> None:
             "debug protocol v2 executable-line stepping: PASS "
             f"(stops={result['executable_line_stops']})"
         )
+    elif scenario == "call_stepping":
+        print(
+            "debug protocol v2 same-line call stepping: PASS "
+            f"(stops={result['call_stepping_stops']})"
+        )
     else:
         print(f"debug protocol v2 dual-channel handshake: PASS (session={session_id})")
 
@@ -731,7 +841,7 @@ def main() -> int:
     parser.add_argument("--godot", required=True, type=Path)
     parser.add_argument(
         "--scenario",
-        choices=("handshake", "control", "timeout", "reconnect", "data_disconnect", "lazy", "backpressure", "executable_lines"),
+        choices=("handshake", "control", "timeout", "reconnect", "data_disconnect", "lazy", "backpressure", "executable_lines", "call_stepping"),
         default="handshake",
     )
     arguments = parser.parse_args()

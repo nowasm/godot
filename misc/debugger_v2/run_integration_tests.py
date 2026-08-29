@@ -22,6 +22,7 @@ SCENARIOS = (
     "lazy",
     "backpressure",
     "executable_lines",
+    "call_stepping",
 )
 
 
