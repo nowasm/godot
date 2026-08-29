@@ -137,26 +137,38 @@ def _ack_for(hello: list[Any]) -> list[Any]:
     ]
 
 
-def _command(hello: list[Any], sequence: int, request_id: int, stop_id: int, message_type: str) -> list[Any]:
+def _command(
+    hello: list[Any],
+    sequence: int,
+    request_id: int,
+    stop_id: int,
+    message_type: str,
+    payload: list[Any] | None = None,
+) -> list[Any]:
     return [
         MAGIC,
         MAJOR,
         MINOR,
         hello[3],
         hello[4],
-        0,
+        hello[5],
         sequence,
         request_id,
         stop_id,
         message_type,
-        [],
+        payload or [],
     ]
 
 
 def _receive_envelope(connection: socket.socket, message_type: str) -> list[Any]:
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
-        packet = _receive_packet(connection)
+        try:
+            packet = _receive_packet(connection)
+        except ProtocolError as error:
+            if str(error).startswith("unsupported Variant type"):
+                continue
+            raise
         if isinstance(packet, list) and len(packet) == 11 and packet[9] == message_type:
             return packet
     raise ProtocolError(f"timed out waiting for {message_type}")
@@ -234,6 +246,79 @@ def _exercise_timeout(control: socket.socket, hello: list[Any], result: dict[str
         )
 
 
+def _exercise_lazy_data(
+    control: socket.socket,
+    data: socket.socket,
+    control_hello: list[Any],
+    data_hello: list[Any],
+    result: dict[str, Any],
+) -> None:
+    stopped = _receive_envelope(control, "stopped")
+    if len(stopped[10]) != 3:
+        raise ProtocolError("stopped eagerly contains debugger data")
+    stop_id = stopped[8]
+
+    started = time.perf_counter()
+    _send_packet(data, _command(data_hello, 2, 100, stop_id, "stack_trace", [0, 20]))
+    stack = _receive_envelope(data, "stack_trace_result")
+    result["stack_msec"] = (time.perf_counter() - started) * 1000.0
+    if result["stack_msec"] >= 200.0 or not stack[10][1]:
+        raise ProtocolError(f"lazy stack response invalid or slow: {stack[10]}")
+    frame_id = stack[10][1][0][0]
+
+    _send_packet(data, _command(data_hello, 3, 101, stop_id, "scopes", [frame_id]))
+    scopes = _receive_envelope(data, "scopes_result")[10][0]
+    scope_by_name = {scope[0]: scope[1] for scope in scopes}
+    if set(scope_by_name) != {"Locals", "Members", "Globals"}:
+        raise ProtocolError(f"unexpected scopes: {scopes}")
+
+    locals_handle = scope_by_name["Locals"]
+    _send_packet(data, _command(data_hello, 4, 102, stop_id, "variables", [locals_handle, 0, 100]))
+    local_page = _receive_envelope(data, "variables_result")[10]
+    descriptors = {item[0]: item for item in local_page[2]}
+    required = {"huge_array", "huge_dictionary", "long_text", "object_value"}
+    if not required.issubset(descriptors):
+        raise ProtocolError(f"missing lazy locals: {sorted(required - set(descriptors))}")
+    if len(descriptors["long_text"][2]) > 260 or descriptors["long_text"][3] == 0:
+        raise ProtocolError("long string was not previewed with a child handle")
+
+    array_handle = descriptors["huge_array"][3]
+    started = time.perf_counter()
+    _send_packet(data, _command(data_hello, 5, 103, stop_id, "variables", [array_handle, 0, 1000]))
+    array_page = _receive_envelope(data, "variables_result")[10]
+    result["array_page_msec"] = (time.perf_counter() - started) * 1000.0
+    if array_page[0] != 10000 or len(array_page[2]) != 100 or not array_page[3]:
+        raise ProtocolError(f"array was not paged to 100 entries: {array_page[:2]}")
+    if result["array_page_msec"] >= 200.0:
+        raise ProtocolError(f"array page took {result['array_page_msec']:.2f} ms")
+
+    dictionary_handle = descriptors["huge_dictionary"][3]
+    _send_packet(data, _command(data_hello, 6, 105, stop_id, "variables", [dictionary_handle, 0, 1000]))
+    dictionary_page = _receive_envelope(data, "variables_result")[10]
+    if dictionary_page[0] != 300 or len(dictionary_page[2]) != 100 or not dictionary_page[3]:
+        raise ProtocolError("dictionary was not paged to the negotiated limit")
+
+    object_handle = descriptors["object_value"][3]
+    _send_packet(data, _command(data_hello, 7, 106, stop_id, "inspect_object", [object_handle, 0, 100]))
+    inspected = _receive_envelope(data, "inspect_object_result")[10]
+    if inspected[0] <= 0 or not inspected[2]:
+        raise ProtocolError("object inspection did not return lazy properties")
+
+    _send_packet(control, _command(control_hello, 8, 50, stop_id, "continue"))
+    _assert_ack(_receive_envelope(control, "ack"), 50, True, "accepted")
+    _receive_envelope(control, "running")
+    next_stopped = _receive_envelope(control, "stopped")
+    next_stop_id = next_stopped[8]
+    _send_packet(data, _command(data_hello, 8, 104, next_stop_id, "variables", [array_handle, 0, 100]))
+    stale = _receive_envelope(data, "request_error")
+    if stale[10][0] != "stale_handle":
+        raise ProtocolError(f"old handle was not invalidated: {stale[10]}")
+
+    _send_packet(control, _command(control_hello, 9, 51, next_stop_id, "continue"))
+    _assert_ack(_receive_envelope(control, "ack"), 51, True, "accepted")
+    _receive_envelope(control, "running")
+
+
 def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> None:
     connections: list[socket.socket] = []
     try:
@@ -291,6 +376,16 @@ def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> No
             if {packet[4] for packet in reconnected} != {original_generation + 1}:
                 raise ProtocolError("reconnect did not advance the generation")
             result["reconnected_generation"] = original_generation + 1
+        elif scenario == "lazy":
+            control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
+            data_index = next(index for index, hello in enumerate(hellos) if hello[9] == "data_hello")
+            _exercise_lazy_data(
+                connections[control_index],
+                connections[data_index],
+                hellos[control_index],
+                hellos[data_index],
+                result,
+            )
     except BaseException as error:  # Relay thread failures to the test runner.
         result["error"] = error
     finally:
@@ -315,7 +410,10 @@ def run_test(godot: Path, scenario: str) -> None:
         (project / "project.godot").write_text(
             '[application]\nconfig/name="debug-v2-handshake"\n', encoding="utf-8"
         )
-        if scenario in ("control", "timeout"):
+        if scenario == "lazy":
+            script_path = Path(__file__).resolve().parent / "fixtures" / "lazy_variables" / "main.gd"
+            script = script_path.read_text(encoding="utf-8")
+        elif scenario in ("control", "timeout"):
             script = (
                 "extends SceneTree\n"
                 "var total = 0\n"
@@ -380,6 +478,11 @@ def run_test(godot: Path, scenario: str) -> None:
             "debug protocol v2 nonblocking reconnect: PASS "
             f"(generation={result['reconnected_generation']})"
         )
+    elif scenario == "lazy":
+        print(
+            "debug protocol v2 lazy variables: PASS "
+            f"(stack={result['stack_msec']:.2f} ms, page={result['array_page_msec']:.2f} ms)"
+        )
     else:
         print(f"debug protocol v2 dual-channel handshake: PASS (session={session_id})")
 
@@ -389,7 +492,7 @@ def main() -> int:
     parser.add_argument("--godot", required=True, type=Path)
     parser.add_argument(
         "--scenario",
-        choices=("handshake", "control", "timeout", "reconnect"),
+        choices=("handshake", "control", "timeout", "reconnect", "lazy"),
         default="handshake",
     )
     arguments = parser.parse_args()

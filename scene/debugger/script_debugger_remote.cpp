@@ -112,6 +112,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 	}
 
 	const uint64_t stop_id = session.enter_paused(p_can_continue, OS::get_singleton()->get_ticks_msec());
+	variable_store.start_stop(stop_id, transport.get_variable_page_size());
 	Array stopped_payload;
 	stopped_payload.push_back(p_can_continue);
 	stopped_payload.push_back(p_script->debug_get_error());
@@ -142,6 +143,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 			}
 			WARN_PRINT("Debugger v2 control channel was lost or timed out while paused; automatically continuing the game.");
 			session.control_lost();
+			variable_store.invalidate();
 			set_depth(-1);
 			set_lines_left(-1);
 			break;
@@ -166,6 +168,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 				resumed = true;
 			}
 			if (resumed) {
+				variable_store.invalidate();
 				session.mark_running(now_msec);
 				Array running_payload;
 				running_payload.push_back(DebugProtocolV2::state_to_string(session.get_state()));
@@ -175,7 +178,9 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		} else if (poll_error != ERR_UNAVAILABLE) {
 			continue;
 		} else {
-			OS::get_singleton()->delay_usec(1000);
+			if (!_poll_data_request(p_script)) {
+				OS::get_singleton()->delay_usec(1000);
+			}
 		}
 
 		OS::get_singleton()->process_and_drop_events();
@@ -208,6 +213,128 @@ DebugSessionV2::Action ScriptDebuggerRemote::_handle_control_message(const Debug
 	DebugSessionV2::Decision decision = session.handle_control(p_message, OS::get_singleton()->get_ticks_msec());
 	_send_control_ack(decision);
 	return decision.action;
+}
+
+void ScriptDebuggerRemote::_send_data_error(const DebugProtocolV2::Envelope &p_request, const String &p_code, const String &p_message) {
+	Array payload;
+	payload.push_back(p_code);
+	payload.push_back(p_message);
+	transport.send_data("request_error", payload, p_request.request_id, session.get_current_stop_id());
+}
+
+bool ScriptDebuggerRemote::_poll_data_request(ScriptLanguage *p_script) {
+	if (!transport.is_data_connected()) {
+		return false;
+	}
+	DebugProtocolV2::Envelope request;
+	Error error = transport.poll_data(request);
+	if (error == ERR_UNAVAILABLE) {
+		return false;
+	}
+	if (error != OK) {
+		return true;
+	}
+	if (request.stop_id != session.get_current_stop_id() || variable_store.get_active_stop_id() != session.get_current_stop_id()) {
+		_send_data_error(request, "stale_stop_id", "The requested debugger stop is no longer active.");
+		return true;
+	}
+
+	if (request.type == "stack_trace") {
+		const int total = p_script->debug_get_stack_level_count();
+		const int start = request.payload.size() > 0 ? CLAMP((int)request.payload[0], 0, total) : 0;
+		const int requested_count = request.payload.size() > 1 ? (int)request.payload[1] : transport.get_variable_page_size();
+		const int count = CLAMP(requested_count <= 0 ? transport.get_variable_page_size() : requested_count, 1, (int)transport.get_variable_page_size());
+		const int end = MIN(start + count, total);
+		Array frames;
+		for (int frame = start; frame < end; frame++) {
+			Array descriptor;
+			descriptor.push_back(frame);
+			descriptor.push_back(p_script->debug_get_stack_level_source(frame));
+			descriptor.push_back(p_script->debug_get_stack_level_line(frame));
+			descriptor.push_back(p_script->debug_get_stack_level_function(frame));
+			frames.push_back(descriptor);
+		}
+		Array payload;
+		payload.push_back(total);
+		payload.push_back(frames);
+		payload.push_back(end < total);
+		transport.send_data("stack_trace_result", payload, request.request_id, request.stop_id);
+		return true;
+	}
+
+	if (request.type == "scopes") {
+		if (request.payload.size() < 1) {
+			_send_data_error(request, "invalid_request", "A stack frame is required.");
+			return true;
+		}
+		const int frame = request.payload[0];
+		if (frame < 0 || frame >= p_script->debug_get_stack_level_count()) {
+			_send_data_error(request, "invalid_frame", "The requested stack frame does not exist.");
+			return true;
+		}
+		Array scopes;
+		const char *scope_names[3] = { "Locals", "Members", "Globals" };
+		for (int scope = 0; scope < 3; scope++) {
+			Array descriptor;
+			descriptor.push_back(scope_names[scope]);
+			descriptor.push_back((int64_t)variable_store.create_scope_handle(frame, (DebugVariableStoreV2::ScopeKind)scope));
+			descriptor.push_back(scope == DebugVariableStoreV2::SCOPE_GLOBALS);
+			scopes.push_back(descriptor);
+		}
+		Array payload;
+		payload.push_back(scopes);
+		transport.send_data("scopes_result", payload, request.request_id, request.stop_id);
+		return true;
+	}
+
+	if (request.type == "variables" || request.type == "inspect_object") {
+		if (request.payload.size() < 1) {
+			_send_data_error(request, "invalid_request", "A variable handle is required.");
+			return true;
+		}
+		const uint64_t handle = (uint64_t)(int64_t)request.payload[0];
+		const int start = request.payload.size() > 1 ? (int)request.payload[1] : 0;
+		const int count = request.payload.size() > 2 ? (int)request.payload[2] : variable_store.get_page_size();
+		Array items;
+		int total = 0;
+		bool has_more = false;
+
+		int frame = 0;
+		DebugVariableStoreV2::ScopeKind scope;
+		if (variable_store.get_scope(handle, frame, scope)) {
+			List<String> names;
+			List<Variant> values;
+			if (scope == DebugVariableStoreV2::SCOPE_LOCALS) {
+				p_script->debug_get_stack_level_locals(frame, &names, &values, 0, 0);
+			} else if (scope == DebugVariableStoreV2::SCOPE_MEMBERS) {
+				if (ScriptInstance *instance = p_script->debug_get_stack_level_instance(frame)) {
+					names.push_back("self");
+					values.push_back(instance->get_owner());
+				}
+				p_script->debug_get_stack_level_members(frame, &names, &values, 0, 0);
+			} else {
+				p_script->debug_get_globals(&names, &values, 0, 0);
+			}
+			error = variable_store.describe_named(names, values, start, count, items, total, has_more);
+		} else {
+			error = variable_store.describe_handle(handle, start, count, items, total, has_more);
+		}
+		if (error != OK) {
+			_send_data_error(request, "stale_handle", "The variable handle is stale or invalid.");
+			return true;
+		}
+
+		Array payload;
+		payload.push_back(total);
+		payload.push_back(MAX(0, start));
+		payload.push_back(items);
+		payload.push_back(has_more);
+		transport.send_data(request.type == "inspect_object" ? "inspect_object_result" : "variables_result", payload, request.request_id, request.stop_id);
+		return true;
+	}
+
+	_send_data_error(request, "unknown_data_request", "Unknown debugger data request '" + request.type + "'.");
+	return true;
 }
 
 void ScriptDebuggerRemote::_get_output() {

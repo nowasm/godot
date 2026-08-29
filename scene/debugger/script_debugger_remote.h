@@ -36,6 +36,7 @@
 #include "core/script_language.h"
 #include "debug_session_v2.h"
 #include "debug_transport_v2.h"
+#include "debug_variable_store_v2.h"
 
 class SceneTree;
 
@@ -66,6 +67,7 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 
 	DebugTransportV2 transport;
 	DebugSessionV2 session;
+	DebugVariableStoreV2 variable_store;
 	Ref<PacketPeerStream> packet_peer_stream;
 
 	uint64_t last_perf_time;
@@ -122,6 +124,8 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 	void _poll_events();
 	DebugSessionV2::Action _handle_control_message(const DebugProtocolV2::Envelope &p_message);
 	void _send_control_ack(const DebugSessionV2::Decision &p_decision);
+	bool _poll_data_request(ScriptLanguage *p_script);
+	void _send_data_error(const DebugProtocolV2::Envelope &p_request, const String &p_code, const String &p_message);
 	uint32_t poll_every;
 	uint64_t next_reconnect_msec;
 
