@@ -219,6 +219,8 @@ A fake debugger frontend launches a minimal Godot project and covers:
 
 The Windows test records command-to-acknowledgement and command-to-next-stop latency. The 95th percentile for 100 step cycles must not exceed 300 ms.
 
+The executable gate is `misc/debugger_v2/run_integration_tests.py`. It runs the engine model and black-box scenarios, the custom-editor smoke test, the VS Code codec tests, and a real VS Code extension-host session against the custom engine. Delivery requires all gates; partial `--skip-*` runs are diagnostic only. The local ACK gate is 100 ms P95 and the end-to-end next-stop gate is 300 ms P95.
+
 ### Brotato stress verification
 
 Run both the custom editor and VS Code clients against Brotato and verify:

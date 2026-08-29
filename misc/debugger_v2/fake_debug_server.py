@@ -416,13 +416,19 @@ def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> No
         elif scenario == "timeout":
             control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
             _exercise_timeout(connections[control_index], hellos[control_index], result)
-        elif scenario == "reconnect":
+        elif scenario in ("reconnect", "data_disconnect"):
             original_session = hellos[0][3]
             original_generation = hellos[0][4]
-            for connection in connections:
-                connection.shutdown(socket.SHUT_RDWR)
-                connection.close()
-            connections.clear()
+            if scenario == "data_disconnect":
+                data_index = next(index for index, hello in enumerate(hellos) if hello[9] == "data_hello")
+                data_connection = connections.pop(data_index)
+                data_connection.shutdown(socket.SHUT_RDWR)
+                data_connection.close()
+            else:
+                for connection in connections:
+                    connection.shutdown(socket.SHUT_RDWR)
+                    connection.close()
+                connections.clear()
             reconnected: list[list[Any]] = []
             for _ in range(2):
                 connection, _ = listener.accept()
@@ -513,7 +519,7 @@ def run_test(godot: Path, scenario: str) -> None:
                 "        total += index\n"
                 "    quit()\n"
             )
-        elif scenario == "reconnect":
+        elif scenario in ("reconnect", "data_disconnect"):
             script = (
                 "extends SceneTree\n"
                 "func _init():\n"
@@ -567,6 +573,11 @@ def run_test(godot: Path, scenario: str) -> None:
             "debug protocol v2 nonblocking reconnect: PASS "
             f"(generation={result['reconnected_generation']})"
         )
+    elif scenario == "data_disconnect":
+        print(
+            "debug protocol v2 data-channel recovery: PASS "
+            f"(generation={result['reconnected_generation']})"
+        )
     elif scenario == "lazy":
         print(
             "debug protocol v2 lazy variables: PASS "
@@ -591,7 +602,7 @@ def main() -> int:
     parser.add_argument("--godot", required=True, type=Path)
     parser.add_argument(
         "--scenario",
-        choices=("handshake", "control", "timeout", "reconnect", "lazy", "backpressure"),
+        choices=("handshake", "control", "timeout", "reconnect", "data_disconnect", "lazy", "backpressure"),
         default="handshake",
     )
     arguments = parser.parse_args()
