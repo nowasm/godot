@@ -42,6 +42,7 @@ public:
 		ACTION_CONTINUE,
 		ACTION_STEP,
 		ACTION_NEXT,
+		ACTION_STEP_OUT,
 	};
 
 	struct Decision {

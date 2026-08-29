@@ -124,7 +124,7 @@ DebugSessionV2::Decision DebugSessionV2::handle_control(const DebugProtocolV2::E
 		return _remember(decision);
 	}
 
-	if (p_message.type == "continue" || p_message.type == "step" || p_message.type == "next") {
+	if (p_message.type == "continue" || p_message.type == "step" || p_message.type == "next" || p_message.type == "step_out") {
 		if (state != DebugProtocolV2::STATE_PAUSED) {
 			decision.reason = "not_paused";
 			return _remember(decision);
@@ -145,6 +145,8 @@ DebugSessionV2::Decision DebugSessionV2::handle_control(const DebugProtocolV2::E
 			decision.action = ACTION_CONTINUE;
 		} else if (p_message.type == "step") {
 			decision.action = ACTION_STEP;
+		} else if (p_message.type == "step_out") {
+			decision.action = ACTION_STEP_OUT;
 		} else {
 			decision.action = ACTION_NEXT;
 		}

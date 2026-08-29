@@ -30,6 +30,8 @@ def main() -> int:
         r"ACTION_CONTINUE": "continue action",
         r"ACTION_STEP": "step action",
         r"ACTION_NEXT": "next action",
+        r"ACTION_STEP_OUT": "step-out action",
+        r'p_message\.type == "step_out"': "step-out command mapping",
         r"duplicate": "duplicate request outcome",
         r"stale_stop_id": "stale stop rejection",
         r"out_of_order_request_id": "out-of-order request rejection",
