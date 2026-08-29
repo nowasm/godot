@@ -319,6 +319,70 @@ def _exercise_lazy_data(
     _receive_envelope(control, "running")
 
 
+def _exercise_backpressure(
+    control: socket.socket,
+    data: socket.socket,
+    control_hello: list[Any],
+    data_hello: list[Any],
+    result: dict[str, Any],
+) -> None:
+    time.sleep(0.2)
+    _send_packet(control, _command(control_hello, 2, 2, 0, "pause"))
+    _assert_ack(_receive_envelope(control, "ack"), 2, True, "accepted")
+    stopped = _receive_envelope(control, "stopped")
+    stop_id = stopped[8]
+
+    acknowledgement_msec: list[float] = []
+    next_stop_msec: list[float] = []
+    for cycle in range(100):
+        request_id = 20 + cycle
+        started = time.perf_counter()
+        _send_packet(control, _command(control_hello, 10 + cycle, request_id, stop_id, "next"))
+        _assert_ack(_receive_envelope(control, "ack"), request_id, True, "accepted")
+        acknowledgement_msec.append((time.perf_counter() - started) * 1000.0)
+        _receive_envelope(control, "running")
+        stopped = _receive_envelope(control, "stopped")
+        next_stop_msec.append((time.perf_counter() - started) * 1000.0)
+        stop_id = stopped[8]
+
+    def percentile(values: list[float], fraction: float) -> float:
+        ordered = sorted(values)
+        return ordered[max(0, int(len(ordered) * fraction) - 1)]
+
+    result["pressure_ack_p95_msec"] = percentile(acknowledgement_msec, 0.95)
+    result["pressure_stop_p95_msec"] = percentile(next_stop_msec, 0.95)
+    if result["pressure_ack_p95_msec"] >= 50.0:
+        raise ProtocolError("control acknowledgements were delayed by data pressure")
+    if result["pressure_stop_p95_msec"] >= 300.0:
+        raise ProtocolError("next-stop latency exceeded 300 ms under data pressure")
+
+    _send_packet(data, _command(data_hello, 199, 499, stop_id, "stress_data_queue", [1024]))
+    _receive_envelope(data, "stress_data_queue_result")
+    _send_packet(data, _command(data_hello, 200, 500, stop_id, "queue_stats"))
+    queue_stats = _receive_envelope(data, "queue_stats_result")[10]
+    if queue_stats[1] > queue_stats[2] or queue_stats[3] <= 0:
+        raise ProtocolError(f"data queue was not bounded or did not drop output: {queue_stats}")
+    result["pressure_dropped"] = queue_stats[3]
+
+    _send_packet(data, _command(data_hello, 201, 501, stop_id, "scene_snapshot"))
+    scene_one = _receive_envelope(data, "scene_snapshot_result")[10]
+    _send_packet(data, _command(data_hello, 202, 502, stop_id, "scene_snapshot"))
+    scene_two = _receive_envelope(data, "scene_snapshot_result")[10]
+    if scene_one[0] != 1 or scene_two[0] != 2 or not scene_one[1]:
+        raise ProtocolError("explicit scene snapshots did not carry revisions")
+
+    _send_packet(data, _command(data_hello, 203, 503, stop_id, "export_trace"))
+    trace = _receive_envelope(data, "export_trace_result")[10][0]
+    if not trace or any(len(entry) != 9 for entry in trace):
+        raise ProtocolError("trace export has an invalid metadata schema")
+    if any("pressure payload" in str(field) for entry in trace for field in entry):
+        raise ProtocolError("trace leaked debugger values")
+
+    result["control_closed_at"] = time.perf_counter()
+    control.shutdown(socket.SHUT_RDWR)
+    control.close()
+
+
 def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> None:
     connections: list[socket.socket] = []
     try:
@@ -386,6 +450,17 @@ def _serve(listener: socket.socket, result: dict[str, Any], scenario: str) -> No
                 hellos[data_index],
                 result,
             )
+        elif scenario == "backpressure":
+            control_index = next(index for index, hello in enumerate(hellos) if hello[9] == "control_hello")
+            data_index = next(index for index, hello in enumerate(hellos) if hello[9] == "data_hello")
+            _exercise_backpressure(
+                connections[control_index],
+                connections[data_index],
+                hellos[control_index],
+                hellos[data_index],
+                result,
+            )
+            connections.pop(control_index)
     except BaseException as error:  # Relay thread failures to the test runner.
         result["error"] = error
     finally:
@@ -410,7 +485,21 @@ def run_test(godot: Path, scenario: str) -> None:
         (project / "project.godot").write_text(
             '[application]\nconfig/name="debug-v2-handshake"\n', encoding="utf-8"
         )
-        if scenario == "lazy":
+        if scenario == "backpressure":
+            script = (
+                "extends SceneTree\n"
+                "var total = 0\n"
+                "func _init():\n"
+                "    call_deferred(\"_exercise\")\n"
+                "func _exercise():\n"
+                "    for _index in range(4000):\n"
+                "        print(\"x\")\n"
+                "    yield(self, \"idle_frame\")\n"
+                "    for index in range(1000000):\n"
+                "        total += index\n"
+                "    quit()\n"
+            )
+        elif scenario == "lazy":
             script_path = Path(__file__).resolve().parent / "fixtures" / "lazy_variables" / "main.gd"
             script = script_path.read_text(encoding="utf-8")
         elif scenario in ("control", "timeout"):
@@ -483,6 +572,16 @@ def run_test(godot: Path, scenario: str) -> None:
             "debug protocol v2 lazy variables: PASS "
             f"(stack={result['stack_msec']:.2f} ms, page={result['array_page_msec']:.2f} ms)"
         )
+    elif scenario == "backpressure":
+        recovery_msec = (time.perf_counter() - result["control_closed_at"]) * 1000.0
+        if recovery_msec >= 1250.0:
+            raise ProtocolError(f"pressure disconnect recovery took {recovery_msec:.2f} ms")
+        print(
+            "debug protocol v2 backpressure: PASS "
+            f"(ack_p95={result['pressure_ack_p95_msec']:.2f} ms, "
+            f"stop_p95={result['pressure_stop_p95_msec']:.2f} ms, "
+            f"dropped={result['pressure_dropped']})"
+        )
     else:
         print(f"debug protocol v2 dual-channel handshake: PASS (session={session_id})")
 
@@ -492,7 +591,7 @@ def main() -> int:
     parser.add_argument("--godot", required=True, type=Path)
     parser.add_argument(
         "--scenario",
-        choices=("handshake", "control", "timeout", "reconnect", "lazy"),
+        choices=("handshake", "control", "timeout", "reconnect", "lazy", "backpressure"),
         default="handshake",
     )
     arguments = parser.parse_args()

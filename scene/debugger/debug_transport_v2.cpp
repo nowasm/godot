@@ -31,6 +31,7 @@
 #include "debug_transport_v2.h"
 
 #include "core/io/ip.h"
+#include "core/io/marshalls.h"
 #include "core/os/os.h"
 
 #include <stdint.h>
@@ -85,6 +86,7 @@ Error DebugTransportV2::_poll(Ref<PacketPeerStream> p_peer, DebugProtocolV2::Cha
 	}
 
 	r_message = message;
+	trace.record("receive", p_channel, message, 0, 0, "accepted");
 	return OK;
 }
 
@@ -157,7 +159,7 @@ Error DebugTransportV2::connect_to_host(const String &p_host, uint16_t p_port, u
 	hello_payload.push_back(OS::get_singleton()->get_process_id());
 	hello_payload.push_back(heartbeat_interval_msec);
 	hello_payload.push_back(variable_page_size);
-	if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK) {
+	if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK || flush_data(1) != 1) {
 		disconnect();
 		return ERR_CANT_CONNECT;
 	}
@@ -188,6 +190,8 @@ void DebugTransportV2::disconnect() {
 	}
 	control_peer->set_stream_peer(Ref<StreamPeer>());
 	data_peer->set_stream_peer(Ref<StreamPeer>());
+	data_queue.clear();
+	data_queue_bytes = 0;
 	reconnecting = false;
 	reconnect_hello_sent = false;
 	reconnect_control_ack = false;
@@ -258,7 +262,7 @@ Error DebugTransportV2::poll_reconnect(uint32_t p_timeout_msec) {
 		hello_payload.push_back(OS::get_singleton()->get_process_id());
 		hello_payload.push_back(heartbeat_interval_msec);
 		hello_payload.push_back(variable_page_size);
-		if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK) {
+		if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK || flush_data(1) != 1) {
 			disconnect();
 			return ERR_CANT_CONNECT;
 		}
@@ -313,10 +317,18 @@ Error DebugTransportV2::send_control(const String &p_type, const Array &p_payloa
 	message.stop_id = p_stop_id;
 	message.type = p_type;
 	message.payload = p_payload;
-	return control_peer->put_var(DebugProtocolV2::encode(message));
+	Error error = control_peer->put_var(DebugProtocolV2::encode(message));
+	trace.record("send", DebugProtocolV2::CHANNEL_CONTROL, message, 0, 0, error == OK ? "sent" : "error");
+	return error;
 }
 
-Error DebugTransportV2::send_data(const String &p_type, const Array &p_payload, uint64_t p_request_id, uint64_t p_stop_id) {
+Error DebugTransportV2::_put_data_immediate(const DebugProtocolV2::Envelope &p_message) {
+	Error error = data_peer->put_var(DebugProtocolV2::encode(p_message));
+	trace.record("send", DebugProtocolV2::CHANNEL_DATA, p_message, 0, 0, error == OK ? "sent" : "error");
+	return error;
+}
+
+Error DebugTransportV2::send_data(const String &p_type, const Array &p_payload, uint64_t p_request_id, uint64_t p_stop_id, DataPriority p_priority) {
 	ERR_FAIL_COND_V(!is_data_connected(), ERR_CONNECTION_ERROR);
 	DebugProtocolV2::Envelope message;
 	message.session_id = session_id;
@@ -327,7 +339,72 @@ Error DebugTransportV2::send_data(const String &p_type, const Array &p_payload, 
 	message.stop_id = p_stop_id;
 	message.type = p_type;
 	message.payload = p_payload;
-	return data_peer->put_var(DebugProtocolV2::encode(message));
+
+	int encoded_bytes = 0;
+	Error error = encode_variant(DebugProtocolV2::encode(message), nullptr, encoded_bytes);
+	if (error != OK) {
+		return error;
+	}
+	encoded_bytes += 4;
+	if (encoded_bytes > data_queue_max_bytes) {
+		dropped_data_messages++;
+		dropped_data_bytes += encoded_bytes;
+		trace.record("queue", DebugProtocolV2::CHANNEL_DATA, message, encoded_bytes, 0, "oversized_drop");
+		return ERR_OUT_OF_MEMORY;
+	}
+
+	while (data_queue.size() >= data_queue_max_messages || data_queue_bytes + encoded_bytes > data_queue_max_bytes) {
+		List<QueuedData>::Element *drop = nullptr;
+		for (List<QueuedData>::Element *element = data_queue.front(); element; element = element->next()) {
+			if (!drop || element->get().priority > drop->get().priority) {
+				drop = element;
+			}
+		}
+		if (!drop || drop->get().priority < p_priority) {
+			dropped_data_messages++;
+			dropped_data_bytes += encoded_bytes;
+			trace.record("queue", DebugProtocolV2::CHANNEL_DATA, message, encoded_bytes, 0, "backpressure_drop");
+			return ERR_BUSY;
+		}
+		data_queue_bytes -= drop->get().bytes;
+		dropped_data_messages++;
+		dropped_data_bytes += drop->get().bytes;
+		trace.record("queue", DebugProtocolV2::CHANNEL_DATA, drop->get().message, drop->get().bytes, 0, "backpressure_drop");
+		data_queue.erase(drop);
+	}
+
+	QueuedData queued;
+	queued.message = message;
+	queued.priority = p_priority;
+	queued.bytes = encoded_bytes;
+	queued.enqueued_usec = OS::get_singleton()->get_ticks_usec();
+	data_queue.push_back(queued);
+	data_queue_bytes += encoded_bytes;
+	trace.record("queue", DebugProtocolV2::CHANNEL_DATA, message, encoded_bytes, 0, "queued");
+	return OK;
+}
+
+int DebugTransportV2::flush_data(int p_max_packets) {
+	int flushed = 0;
+	while (flushed < p_max_packets && data_queue.size() > 0 && is_data_connected()) {
+		List<QueuedData>::Element *selected = data_queue.front();
+		for (List<QueuedData>::Element *element = selected->next(); element; element = element->next()) {
+			if (element->get().priority < selected->get().priority) {
+				selected = element;
+			}
+		}
+		const QueuedData queued = selected->get();
+		data_queue_bytes -= queued.bytes;
+		data_queue.erase(selected);
+		const uint64_t queue_usec = OS::get_singleton()->get_ticks_usec() - queued.enqueued_usec;
+		Error error = _put_data_immediate(queued.message);
+		trace.record("flush", DebugProtocolV2::CHANNEL_DATA, queued.message, queued.bytes, queue_usec, error == OK ? "sent" : "error");
+		if (error != OK) {
+			break;
+		}
+		flushed++;
+	}
+	return flushed;
 }
 
 Error DebugTransportV2::poll_control(DebugProtocolV2::Envelope &r_message) {

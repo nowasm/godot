@@ -105,6 +105,7 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 	int max_warnings_per_second;
 	int n_errors_dropped;
 	int n_warnings_dropped;
+	uint64_t last_transport_dropped;
 
 	int max_cps;
 	int char_count;
@@ -128,6 +129,9 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 	void _send_data_error(const DebugProtocolV2::Envelope &p_request, const String &p_code, const String &p_message);
 	uint32_t poll_every;
 	uint64_t next_reconnect_msec;
+	uint64_t scene_revision;
+	uint64_t pending_scene_request_id;
+	uint64_t pending_scene_stop_id;
 
 	SceneTree *scene_tree;
 

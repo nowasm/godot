@@ -49,20 +49,24 @@ void ScriptDebuggerRemote::_send_video_memory() {
 
 	usage.sort();
 
-	packet_peer_stream->put_var("message:video_mem");
-	packet_peer_stream->put_var(usage.size() * 4);
-
+	Array resources;
 	for (List<ResourceUsage>::Element *E = usage.front(); E; E = E->next()) {
-		packet_peer_stream->put_var(E->get().path);
-		packet_peer_stream->put_var(E->get().type);
-		packet_peer_stream->put_var(E->get().format);
-		packet_peer_stream->put_var(E->get().vram);
+		Array descriptor;
+		descriptor.push_back(E->get().path);
+		descriptor.push_back(E->get().type);
+		descriptor.push_back(E->get().format);
+		descriptor.push_back(E->get().vram);
+		resources.push_back(descriptor);
 	}
+	Array payload;
+	payload.push_back(resources);
+	transport.send_data("video_memory", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 }
 
 Error ScriptDebuggerRemote::connect_to_host(const String &p_host, uint16_t p_port) {
 	Error error = transport.connect_to_host(p_host, p_port);
 	if (error == OK) {
+		transport.trace_state(session.get_state(), DebugProtocolV2::STATE_RUNNING, "connected");
 		session.connected(transport.get_generation(), OS::get_singleton()->get_ticks_msec());
 	}
 	return error;
@@ -111,7 +115,9 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		OS::get_singleton()->enable_for_stealing_focus(allow_focus_steal_pid);
 	}
 
+	const DebugProtocolV2::State previous_state = session.get_state();
 	const uint64_t stop_id = session.enter_paused(p_can_continue, OS::get_singleton()->get_ticks_msec());
+	transport.trace_state(previous_state, session.get_state(), "stopped");
 	variable_store.start_stop(stop_id, transport.get_variable_page_size());
 	Array stopped_payload;
 	stopped_payload.push_back(p_can_continue);
@@ -134,6 +140,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 	bool resumed = false;
 	uint64_t last_draw_usec = OS::get_singleton()->get_ticks_usec();
 	while (true) {
+		transport.flush_data(4);
 		const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
 		if (!transport.is_control_connected() || session.heartbeat_expired(now_msec, transport.get_heartbeat_timeout_msec())) {
 			if (transport.is_control_connected()) {
@@ -142,6 +149,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 				transport.send_control("diagnostic", diagnostic, 0, stop_id);
 			}
 			WARN_PRINT("Debugger v2 control channel was lost or timed out while paused; automatically continuing the game.");
+			transport.trace_state(session.get_state(), DebugProtocolV2::STATE_DISCONNECTED, "control_lost");
 			session.control_lost();
 			variable_store.invalidate();
 			set_depth(-1);
@@ -169,6 +177,7 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 			}
 			if (resumed) {
 				variable_store.invalidate();
+				transport.trace_state(session.get_state(), DebugProtocolV2::STATE_RUNNING, "resume_acknowledged");
 				session.mark_running(now_msec);
 				Array running_payload;
 				running_payload.push_back(DebugProtocolV2::state_to_string(session.get_state()));
@@ -234,8 +243,57 @@ bool ScriptDebuggerRemote::_poll_data_request(ScriptLanguage *p_script) {
 	if (error != OK) {
 		return true;
 	}
+
+	if (request.type == "queue_stats") {
+		Array payload;
+		payload.push_back(transport.get_queued_data_messages());
+		payload.push_back(transport.get_queued_data_bytes());
+		payload.push_back(transport.get_data_queue_max_bytes());
+		payload.push_back((int64_t)transport.get_dropped_data_messages());
+		payload.push_back((int64_t)transport.get_dropped_data_bytes());
+		transport.send_data("queue_stats_result", payload, request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "stress_data_queue") {
+		const int messages_to_queue = request.payload.size() > 0 ? CLAMP((int)request.payload[0], 1, 4096) : 1024;
+		for (int index = 0; index < messages_to_queue; index++) {
+			Array probe;
+			probe.push_back(index);
+			transport.send_data("stress_output", probe, 0, request.stop_id, DebugTransportV2::DATA_PRIORITY_OUTPUT);
+		}
+		Array payload;
+		payload.push_back(messages_to_queue);
+		transport.send_data("stress_data_queue_result", payload, request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "export_trace") {
+		Array payload;
+		payload.push_back(transport.export_trace());
+		transport.send_data("export_trace_result", payload, request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "scene_snapshot") {
+#ifdef DEBUG_ENABLED
+		if (scene_tree) {
+			pending_scene_request_id = request.request_id;
+			pending_scene_stop_id = request.stop_id;
+			scene_tree->_debugger_request_tree();
+			pending_scene_request_id = 0;
+			pending_scene_stop_id = 0;
+		} else {
+			_send_data_error(request, "scene_unavailable", "The running project has no SceneTree.");
+		}
+#else
+		_send_data_error(request, "scene_unavailable", "Scene snapshots require a debug build.");
+#endif
+		return true;
+	}
 	if (request.stop_id != session.get_current_stop_id() || variable_store.get_active_stop_id() != session.get_current_stop_id()) {
 		_send_data_error(request, "stale_stop_id", "The requested debugger stop is no longer active.");
+		return true;
+	}
+	if (!p_script) {
+		_send_data_error(request, "not_paused", "Stack and variable requests require an active debugger stop.");
 		return true;
 	}
 
@@ -339,23 +397,14 @@ bool ScriptDebuggerRemote::_poll_data_request(ScriptLanguage *p_script) {
 
 void ScriptDebuggerRemote::_get_output() {
 	mutex.lock();
-	if (output_strings.size()) {
-		locking = true;
-		packet_peer_stream->put_var("output");
-		packet_peer_stream->put_var(output_strings.size());
-
-		while (output_strings.size()) {
-			const OutputString &output_string = output_strings.front()->get();
-
-			Array msg_data;
-			msg_data.push_back(output_string.message);
-			msg_data.push_back(output_string.type);
-
-			packet_peer_stream->put_var(msg_data);
-
-			output_strings.pop_front();
-		}
-		locking = false;
+	locking = true;
+	while (output_strings.size()) {
+		const OutputString output_string = output_strings.front()->get();
+		output_strings.pop_front();
+		Array payload;
+		payload.push_back(output_string.message);
+		payload.push_back(output_string.type);
+		transport.send_data("output", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_OUTPUT);
 	}
 
 	if (n_messages_dropped > 0) {
@@ -366,14 +415,9 @@ void ScriptDebuggerRemote::_get_output() {
 	}
 
 	while (messages.size()) {
-		locking = true;
-		packet_peer_stream->put_var("message:" + messages.front()->get().message);
-		packet_peer_stream->put_var(messages.front()->get().data.size());
-		for (int i = 0; i < messages.front()->get().data.size(); i++) {
-			packet_peer_stream->put_var(messages.front()->get().data[i]);
-		}
+		const Message message = messages.front()->get();
 		messages.pop_front();
-		locking = false;
+		transport.send_data("message:" + message.message, message.data, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 	}
 
 	if (n_errors_dropped == 1) {
@@ -405,14 +449,9 @@ void ScriptDebuggerRemote::_get_output() {
 	}
 
 	while (errors.size()) {
-		locking = true;
-		packet_peer_stream->put_var("error");
-		OutputError oe = errors.front()->get();
-
-		packet_peer_stream->put_var(oe.callstack.size() + 2);
-
+		const OutputError oe = errors.front()->get();
+		errors.pop_front();
 		Array error_data;
-
 		error_data.push_back(oe.hr);
 		error_data.push_back(oe.min);
 		error_data.push_back(oe.sec);
@@ -423,15 +462,22 @@ void ScriptDebuggerRemote::_get_output() {
 		error_data.push_back(oe.error);
 		error_data.push_back(oe.error_descr);
 		error_data.push_back(oe.warning);
-		packet_peer_stream->put_var(error_data);
-		packet_peer_stream->put_var(oe.callstack.size());
-		for (int i = 0; i < oe.callstack.size(); i++) {
-			packet_peer_stream->put_var(oe.callstack[i]);
-		}
-
-		errors.pop_front();
-		locking = false;
+		Array payload;
+		payload.push_back(error_data);
+		payload.push_back(oe.callstack);
+		transport.send_data("error", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 	}
+
+	const uint64_t transport_dropped = transport.get_dropped_data_messages();
+	if (transport_dropped != last_transport_dropped) {
+		Array payload;
+		payload.push_back((int64_t)transport_dropped);
+		payload.push_back((int64_t)transport.get_dropped_data_bytes());
+		payload.push_back(transport.get_queued_data_bytes());
+		transport.send_data("data_drop_summary", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
+		last_transport_dropped = transport_dropped;
+	}
+	locking = false;
 	mutex.unlock();
 }
 
@@ -705,120 +751,9 @@ void ScriptDebuggerRemote::_poll_events() {
 		return;
 	}
 
-	while (packet_peer_stream->get_available_packet_count() > 0) {
-		_get_output();
-
-		//send over output_strings
-
-		Variant var;
-		Error err = packet_peer_stream->get_var(var);
-
-		ERR_CONTINUE(err != OK);
-		ERR_CONTINUE(var.get_type() != Variant::ARRAY);
-
-		Array cmd = var;
-
-		ERR_CONTINUE(cmd.size() == 0);
-		ERR_CONTINUE(cmd[0].get_type() != Variant::STRING);
-
-		String command = cmd[0];
-		//cmd.remove(0);
-
-		if (command == "break") {
-			if (get_break_language()) {
-				debug(get_break_language());
-			}
-		} else if (command == "save_node") {
-			_save_node(cmd[1], cmd[2]);
-		} else if (command == "request_scene_tree") {
-#ifdef DEBUG_ENABLED
-			if (scene_tree) {
-				scene_tree->_debugger_request_tree();
-			}
-#endif
-		} else if (command == "request_video_mem") {
-			_send_video_memory();
-		} else if (command == "inspect_object") {
-			ObjectID id = cmd[1];
-			_send_object_id(id);
-		} else if (command == "set_object_property") {
-			_set_object_property(cmd[1], cmd[2], cmd[3]);
-
-		} else if (command == "start_profiling") {
-			for (int i = 0; i < ScriptServer::get_language_count(); i++) {
-				ScriptServer::get_language(i)->profiling_start();
-			}
-
-			max_frame_functions = cmd[1];
-			profiler_function_signature_map.clear();
-			profiling = true;
-			frame_time = 0;
-			process_time = 0;
-			physics_time = 0;
-			physics_frame_time = 0;
-
-			print_verbose("Starting profiling.");
-
-		} else if (command == "stop_profiling") {
-			for (int i = 0; i < ScriptServer::get_language_count(); i++) {
-				ScriptServer::get_language(i)->profiling_stop();
-			}
-			profiling = false;
-			_send_profiling_data(false);
-			print_verbose("Ending profiling.");
-		} else if (command == "start_network_profiling") {
-			multiplayer->profiling_start();
-			profiling_network = true;
-		} else if (command == "stop_network_profiling") {
-			multiplayer->profiling_end();
-			profiling_network = false;
-		} else if (command == "override_camera_2D:set") {
-			bool enforce = cmd[1];
-
-			if (scene_tree) {
-				scene_tree->get_root()->enable_canvas_transform_override(enforce);
-			}
-		} else if (command == "override_camera_2D:transform") {
-			Transform2D transform = cmd[1];
-
-			if (scene_tree) {
-				scene_tree->get_root()->set_canvas_transform_override(transform);
-			}
-		} else if (command == "override_camera_3D:set") {
-			bool enable = cmd[1];
-
-			if (scene_tree) {
-				scene_tree->get_root()->enable_camera_override(enable);
-			}
-		} else if (command == "override_camera_3D:transform") {
-			Transform transform = cmd[1];
-			bool is_perspective = cmd[2];
-			float size_or_fov = cmd[3];
-			float near = cmd[4];
-			float far = cmd[5];
-
-			if (scene_tree) {
-				if (is_perspective) {
-					scene_tree->get_root()->set_camera_override_perspective(size_or_fov, near, far);
-				} else {
-					scene_tree->get_root()->set_camera_override_orthogonal(size_or_fov, near, far);
-				}
-				scene_tree->get_root()->set_camera_override_transform(transform);
-			}
-
-		} else if (command == "reload_scripts") {
-			reload_all_scripts = true;
-		} else if (command == "breakpoint") {
-			bool set = cmd[3];
-			if (set) {
-				insert_breakpoint(cmd[2], cmd[1]);
-			} else {
-				remove_breakpoint(cmd[2], cmd[1]);
-			}
-		} else if (command == "set_skip_breakpoints") {
-			skip_breakpoints = cmd[1];
-		} else {
-			_parse_live_edit(cmd);
+	for (int request = 0; request < 8; request++) {
+		if (!_poll_data_request(nullptr)) {
+			break;
 		}
 	}
 }
@@ -845,51 +780,32 @@ void ScriptDebuggerRemote::_send_profiling_data(bool p_for_frame) {
 
 	//check signatures first
 	uint64_t total_script_time = 0;
+	Array signatures;
 
 	for (int i = 0; i < to_send; i++) {
 		if (!profiler_function_signature_map.has(profile_info_ptrs[i]->signature)) {
 			int idx = profiler_function_signature_map.size();
-			packet_peer_stream->put_var("profile_sig");
-			packet_peer_stream->put_var(2);
-			packet_peer_stream->put_var(profile_info_ptrs[i]->signature);
-			packet_peer_stream->put_var(idx);
-
 			profiler_function_signature_map[profile_info_ptrs[i]->signature] = idx;
+			Array signature;
+			signature.push_back(profile_info_ptrs[i]->signature);
+			signature.push_back(idx);
+			signatures.push_back(signature);
 		}
 
 		total_script_time += profile_info_ptrs[i]->self_time;
 	}
 
-	//send frames then
-
+	Array custom_frames;
 	if (p_for_frame) {
-		packet_peer_stream->put_var("profile_frame");
-		packet_peer_stream->put_var(8 + profile_frame_data.size() * 2 + to_send * 4);
-	} else {
-		packet_peer_stream->put_var("profile_total");
-		packet_peer_stream->put_var(8 + to_send * 4);
-	}
-
-	packet_peer_stream->put_var(Engine::get_singleton()->get_idle_frames()); //total frame time
-	packet_peer_stream->put_var(frame_time); //total frame time
-	packet_peer_stream->put_var(process_time); //idle frame time
-	packet_peer_stream->put_var(physics_time); //fixed frame time
-	packet_peer_stream->put_var(physics_frame_time); //fixed frame time
-
-	packet_peer_stream->put_var(USEC_TO_SEC(total_script_time)); //total script execution time
-
-	if (p_for_frame) {
-		packet_peer_stream->put_var(profile_frame_data.size()); //how many profile framedatas to send
-		packet_peer_stream->put_var(to_send); //how many script functions to send
 		for (int i = 0; i < profile_frame_data.size(); i++) {
-			packet_peer_stream->put_var(profile_frame_data[i].name);
-			packet_peer_stream->put_var(profile_frame_data[i].data);
+			Array custom;
+			custom.push_back(profile_frame_data[i].name);
+			custom.push_back(profile_frame_data[i].data);
+			custom_frames.push_back(custom);
 		}
-	} else {
-		packet_peer_stream->put_var(0); //how many script functions to send
-		packet_peer_stream->put_var(to_send); //how many script functions to send
 	}
 
+	Array functions;
 	for (int i = 0; i < to_send; i++) {
 		int sig_id = -1;
 
@@ -897,11 +813,25 @@ void ScriptDebuggerRemote::_send_profiling_data(bool p_for_frame) {
 			sig_id = profiler_function_signature_map[profile_info_ptrs[i]->signature];
 		}
 
-		packet_peer_stream->put_var(sig_id);
-		packet_peer_stream->put_var(profile_info_ptrs[i]->call_count);
-		packet_peer_stream->put_var(profile_info_ptrs[i]->total_time / 1000000.0);
-		packet_peer_stream->put_var(profile_info_ptrs[i]->self_time / 1000000.0);
+		Array function;
+		function.push_back(sig_id);
+		function.push_back(profile_info_ptrs[i]->call_count);
+		function.push_back(profile_info_ptrs[i]->total_time / 1000000.0);
+		function.push_back(profile_info_ptrs[i]->self_time / 1000000.0);
+		functions.push_back(function);
 	}
+
+	Array payload;
+	payload.push_back(signatures);
+	payload.push_back(Engine::get_singleton()->get_idle_frames());
+	payload.push_back(frame_time);
+	payload.push_back(process_time);
+	payload.push_back(physics_time);
+	payload.push_back(physics_frame_time);
+	payload.push_back(USEC_TO_SEC(total_script_time));
+	payload.push_back(custom_frames);
+	payload.push_back(functions);
+	transport.send_data(p_for_frame ? "profile_frame" : "profile_total", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 
 	if (p_for_frame) {
 		profile_frame_data.clear();
@@ -916,6 +846,7 @@ void ScriptDebuggerRemote::idle_poll() {
 		if (transport.is_reconnecting()) {
 			Error reconnect_error = transport.poll_reconnect();
 			if (reconnect_error == OK) {
+				transport.trace_state(session.get_state(), DebugProtocolV2::STATE_RUNNING, "reconnected");
 				session.connected(transport.get_generation(), now_msec);
 			} else if (reconnect_error != ERR_BUSY) {
 				next_reconnect_msec = now_msec + 250;
@@ -934,10 +865,10 @@ void ScriptDebuggerRemote::idle_poll() {
 	}
 
 	_get_output();
+	transport.flush_data(4);
 
 	if (requested_quit) {
-		packet_peer_stream->put_var("kill_me");
-		packet_peer_stream->put_var(0);
+		transport.send_data("kill_me", Array(), 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
 		requested_quit = false;
 	}
 
@@ -951,9 +882,9 @@ void ScriptDebuggerRemote::idle_poll() {
 			for (int i = 0; i < max; i++) {
 				arr[i] = performance->call("get_monitor", i);
 			}
-			packet_peer_stream->put_var("performance");
-			packet_peer_stream->put_var(1);
-			packet_peer_stream->put_var(arr);
+			Array payload;
+			payload.push_back(arr);
+			transport.send_data("performance", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 		}
 	}
 
@@ -986,6 +917,7 @@ void ScriptDebuggerRemote::idle_poll() {
 	}
 
 	_poll_events();
+	transport.flush_data(4);
 }
 
 void ScriptDebuggerRemote::_send_network_profiling_data() {
@@ -993,16 +925,20 @@ void ScriptDebuggerRemote::_send_network_profiling_data() {
 
 	int n_nodes = multiplayer->get_profiling_frame(&network_profile_info.write[0]);
 
-	packet_peer_stream->put_var("network_profile");
-	packet_peer_stream->put_var(n_nodes * 6);
+	Array nodes;
 	for (int i = 0; i < n_nodes; ++i) {
-		packet_peer_stream->put_var(network_profile_info[i].node);
-		packet_peer_stream->put_var(network_profile_info[i].node_path);
-		packet_peer_stream->put_var(network_profile_info[i].incoming_rpc);
-		packet_peer_stream->put_var(network_profile_info[i].incoming_rset);
-		packet_peer_stream->put_var(network_profile_info[i].outgoing_rpc);
-		packet_peer_stream->put_var(network_profile_info[i].outgoing_rset);
+		Array node;
+		node.push_back(network_profile_info[i].node);
+		node.push_back(network_profile_info[i].node_path);
+		node.push_back(network_profile_info[i].incoming_rpc);
+		node.push_back(network_profile_info[i].incoming_rset);
+		node.push_back(network_profile_info[i].outgoing_rpc);
+		node.push_back(network_profile_info[i].outgoing_rset);
+		nodes.push_back(node);
 	}
+	Array payload;
+	payload.push_back(nodes);
+	transport.send_data("network_profile", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 }
 
 void ScriptDebuggerRemote::_send_network_bandwidth_usage() {
@@ -1011,13 +947,22 @@ void ScriptDebuggerRemote::_send_network_bandwidth_usage() {
 	int incoming_bandwidth = multiplayer->get_incoming_bandwidth_usage();
 	int outgoing_bandwidth = multiplayer->get_outgoing_bandwidth_usage();
 
-	packet_peer_stream->put_var("network_bandwidth");
-	packet_peer_stream->put_var(2);
-	packet_peer_stream->put_var(incoming_bandwidth);
-	packet_peer_stream->put_var(outgoing_bandwidth);
+	Array payload;
+	payload.push_back(incoming_bandwidth);
+	payload.push_back(outgoing_bandwidth);
+	transport.send_data("network_bandwidth", payload, 0, session.get_current_stop_id(), DebugTransportV2::DATA_PRIORITY_BACKGROUND);
 }
 
 void ScriptDebuggerRemote::send_message(const String &p_message, const Array &p_args) {
+	if (p_message == "scene_tree") {
+		if (pending_scene_request_id != 0) {
+			Array payload;
+			payload.push_back((int64_t)++scene_revision);
+			payload.push_back(p_args);
+			transport.send_data("scene_snapshot_result", payload, pending_scene_request_id, pending_scene_stop_id, DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
+		}
+		return;
+	}
 	mutex.lock();
 	if (!locking && transport.is_data_connected()) {
 		if (messages.size() >= max_messages_per_frame) {
@@ -1215,6 +1160,7 @@ ScriptDebuggerRemote::ScriptDebuggerRemote() :
 		max_warnings_per_second(GLOBAL_GET("network/limits/debugger_stdout/max_warnings_per_second")),
 		n_errors_dropped(0),
 		n_warnings_dropped(0),
+		last_transport_dropped(0),
 		max_cps(GLOBAL_GET("network/limits/debugger_stdout/max_chars_per_second")),
 		char_count(0),
 		err_count(0),
@@ -1225,6 +1171,9 @@ ScriptDebuggerRemote::ScriptDebuggerRemote() :
 		locking(false),
 		poll_every(0),
 		next_reconnect_msec(0),
+		scene_revision(0),
+		pending_scene_request_id(0),
+		pending_scene_stop_id(0),
 		scene_tree(nullptr) {
 	phl.printfunc = _print_handler;
 	phl.userdata = this;
