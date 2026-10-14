@@ -39,6 +39,7 @@
 #include "debug_variable_store_v2.h"
 
 class SceneTree;
+class RuntimeNodeSelect;
 
 class ScriptDebuggerRemote : public ScriptDebugger {
 	struct Message {
@@ -134,6 +135,9 @@ class ScriptDebuggerRemote : public ScriptDebugger {
 	uint64_t pending_scene_stop_id;
 
 	SceneTree *scene_tree;
+#ifdef DEBUG_ENABLED
+	RuntimeNodeSelect *runtime_node_select = nullptr;
+#endif
 
 	bool _parse_live_edit(const Array &p_command);
 

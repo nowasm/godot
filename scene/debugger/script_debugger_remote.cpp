@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "script_debugger_remote.h"
+#include "runtime_node_select.h"
 
 #include "core/engine.h"
 #include "core/io/marshalls.h"
@@ -174,6 +175,11 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 				transport.send_control("diagnostic", diagnostic, 0, stop_id);
 			}
 			WARN_PRINT("Debugger v2 control channel was lost or timed out while paused; automatically continuing the game.");
+#ifdef DEBUG_ENABLED
+			if (runtime_node_select) {
+				runtime_node_select->clear();
+			}
+#endif
 			transport.trace_state(session.get_state(), DebugProtocolV2::STATE_DISCONNECTED, "control_lost");
 			session.control_lost();
 			variable_store.invalidate();
@@ -229,6 +235,15 @@ void ScriptDebuggerRemote::debug(ScriptLanguage *p_script, bool p_can_continue, 
 		OS::get_singleton()->process_and_drop_events();
 		const uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
 		if (now_usec - last_draw_usec >= 16000) {
+#ifdef DEBUG_ENABLED
+			if (runtime_node_select) {
+				if (transport.is_connected()) {
+					runtime_node_select->update();
+				} else {
+					runtime_node_select->clear();
+				}
+			}
+#endif
 			const float elapsed_seconds = (now_usec - last_draw_usec) / 1000000.0f;
 			last_draw_usec = now_usec;
 			VisualServer::get_singleton()->sync();
@@ -345,6 +360,29 @@ bool ScriptDebuggerRemote::_poll_data_request(ScriptLanguage *p_script) {
 		Array payload;
 		payload.push_back(transport.export_trace());
 		transport.send_data("export_trace_result", payload, request.request_id, request.stop_id, DebugTransportV2::DATA_PRIORITY_ACTIVE);
+		return true;
+	}
+	if (request.type == "runtime_node_select") {
+#ifdef DEBUG_ENABLED
+		if (request.payload.size() != 2 || request.payload[0].get_type() != Variant::INT || request.payload[1].get_type() != Variant::BOOL) {
+			_send_data_error(request, "invalid_payload", "Node selection requires an object ID and visibility flag.");
+			return true;
+		}
+		if (!runtime_node_select) {
+			runtime_node_select = memnew(RuntimeNodeSelect);
+		}
+		const ObjectID id = (ObjectID)(int64_t)request.payload[0];
+		if (runtime_node_select->select(id, request.payload[1]) != OK) {
+			_send_data_error(request, "object_unavailable", "The selected node no longer exists.");
+		} else {
+			Array payload;
+			payload.push_back((int64_t)id);
+			payload.push_back(runtime_node_select->get_selection_kind());
+			transport.send_data("runtime_node_select_result", payload, request.request_id, 0, DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
+		}
+#else
+		_send_data_error(request, "selection_unavailable", "Node selection requires a debug build.");
+#endif
 		return true;
 	}
 	if (request.type == "scene_snapshot") {
@@ -923,6 +961,15 @@ void ScriptDebuggerRemote::_send_profiling_data(bool p_for_frame) {
 void ScriptDebuggerRemote::idle_poll() {
 	// this function is called every frame, except when there is a debugger break (::debug() in this class)
 	// execution stops and remains in the ::debug function
+#ifdef DEBUG_ENABLED
+	if (runtime_node_select) {
+		if (transport.is_connected()) {
+			runtime_node_select->update();
+		} else {
+			runtime_node_select->clear();
+		}
+	}
+#endif
 	if (!transport.is_connected()) {
 		const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
 		if (transport.is_reconnecting()) {
@@ -1271,6 +1318,11 @@ ScriptDebuggerRemote::ScriptDebuggerRemote() :
 }
 
 ScriptDebuggerRemote::~ScriptDebuggerRemote() {
+#ifdef DEBUG_ENABLED
+	if (runtime_node_select) {
+		memdelete(runtime_node_select);
+	}
+#endif
 	remove_print_handler(&phl);
 	remove_error_handler(&eh);
 }

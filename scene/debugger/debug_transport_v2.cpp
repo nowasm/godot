@@ -159,6 +159,11 @@ Error DebugTransportV2::connect_to_host(const String &p_host, uint16_t p_port, u
 	hello_payload.push_back(OS::get_singleton()->get_process_id());
 	hello_payload.push_back(heartbeat_interval_msec);
 	hello_payload.push_back(variable_page_size);
+	Array capabilities;
+#ifdef DEBUG_ENABLED
+	capabilities.push_back("runtime_node_select");
+#endif
+	hello_payload.push_back(capabilities);
 	if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK || flush_data(1) != 1) {
 		disconnect();
 		return ERR_CANT_CONNECT;
@@ -262,6 +267,11 @@ Error DebugTransportV2::poll_reconnect(uint32_t p_timeout_msec) {
 		hello_payload.push_back(OS::get_singleton()->get_process_id());
 		hello_payload.push_back(heartbeat_interval_msec);
 		hello_payload.push_back(variable_page_size);
+		Array capabilities;
+#ifdef DEBUG_ENABLED
+		capabilities.push_back("runtime_node_select");
+#endif
+		hello_payload.push_back(capabilities);
 		if (send_control("control_hello", hello_payload, 1) != OK || send_data("data_hello", hello_payload, 1) != OK || flush_data(1) != 1) {
 			disconnect();
 			return ERR_CANT_CONNECT;
