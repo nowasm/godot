@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import socket
 import subprocess
 import tempfile
 from pathlib import Path
@@ -12,6 +14,23 @@ from pathlib import Path
 def run(godot: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="godot-debug-v2-editor-") as directory:
         project = Path(directory)
+
+        # Keep the smoke editor away from the user's debugger listener and settings.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            debug_port = listener.getsockname()[1]
+        config_home = project / "editor-config"
+        godot_config = config_home / "Godot"
+        godot_config.mkdir(parents=True)
+        (godot_config / "editor_settings-3.tres").write_text(
+            '[gd_resource type="EditorSettings" format=2]\n\n[resource]\n'
+            'network/debug/remote_host = "127.0.0.1"\n'
+            f'network/debug/remote_port = {debug_port}\n',
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["APPDATA"] = str(config_home)
+        environment["LOCALAPPDATA"] = str(config_home)
         addon = project / "addons" / "auto_play"
         addon.mkdir(parents=True)
         (project / "project.godot").write_text(
@@ -92,6 +111,7 @@ def run(godot: Path) -> None:
                 timeout=20.0,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=environment,
             )
         except subprocess.TimeoutExpired as error:
             partial_stdout = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else (error.stdout or "")
