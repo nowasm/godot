@@ -36,6 +36,11 @@
 #include "core/os/input.h"
 #include "core/os/os.h"
 #include "core/project_settings.h"
+#include "scene/2d/canvas_item.h"
+#ifndef _3D_DISABLED
+#include "scene/3d/spatial.h"
+#endif
+#include "scene/main/canvas_layer.h"
 #include "scene/main/node.h"
 #include "scene/main/scene_tree.h"
 #include "scene/main/viewport.h"
@@ -1088,6 +1093,27 @@ void ScriptDebuggerRemote::send_message(const String &p_message, const Array &p_
 			Array payload;
 			payload.push_back((int64_t)++scene_revision);
 			payload.push_back(p_args);
+			// Optional metadata keeps the original four-field tree compatible with old clients.
+			// Match Godot 4's visibility bits: 2 = supported, 4 = local, 8 = in-tree.
+			Array visibility;
+			for (int i = 3; i < p_args.size(); i += 4) {
+				const ObjectID id = (ObjectID)(int64_t)p_args[i];
+				Object *object = ObjectDB::get_instance(id);
+				int flags = 0;
+				if (CanvasItem *item = Object::cast_to<CanvasItem>(object)) {
+					flags = 2 | (item->is_visible() ? 4 : 0) | (item->is_visible_in_tree() ? 8 : 0);
+				} else if (CanvasLayer *layer = Object::cast_to<CanvasLayer>(object)) {
+					// CanvasLayers own independent canvases and have no inherited visibility method.
+					flags = 2 | (layer->is_visible() ? 12 : 0);
+#ifndef _3D_DISABLED
+				} else if (Spatial *spatial = Object::cast_to<Spatial>(object)) {
+					flags = 2 | (spatial->is_visible() ? 4 : 0) | (spatial->is_visible_in_tree() ? 8 : 0);
+#endif
+				}
+				visibility.push_back((int64_t)id);
+				visibility.push_back(flags);
+			}
+			payload.push_back(visibility);
 			transport.send_data("scene_snapshot_result", payload, pending_scene_request_id, pending_scene_stop_id, DebugTransportV2::DATA_PRIORITY_INTERACTIVE);
 		}
 		return;
